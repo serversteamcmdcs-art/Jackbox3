@@ -16,7 +16,15 @@
 
 var http = require("http");
 var wslib = require("ws");
-var URL = require("url");
+
+// Парсим URL через современный WHATWG URL API (без deprecated url.parse)
+function parseURL(reqUrl, baseHost) {
+  try {
+    return new URL(reqUrl, `http://${baseHost || "localhost"}`);
+  } catch(e) {
+    return new URL("http://localhost/");
+  }
+}
 
 // ==================== CONFIG ====================
 const PORT = process.env.PORT || 8080;
@@ -113,7 +121,7 @@ function blobCreateRoom(appTag) {
 
 // ==================== HTTP SERVER ====================
 var server = http.createServer((req, res) => {
-  const parsed = URL.parse(req.url, true);
+  const parsed = parseURL(req.url, req.headers.host);
   const path = parsed.pathname;
 
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -218,8 +226,8 @@ var server = http.createServer((req, res) => {
 
   // ---- Engine.IO HTTP polling (fallback для старых клиентов) ----
   if (path === "/socket.io/" || path === "/socket.io") {
-    const sid = parsed.query.sid || genSID();
-    if (!parsed.query.sid) {
+    const sid = parsed.searchParams.get("sid") || genSID();
+    if (!parsed.searchParams.get("sid")) {
       const packet = "0" + JSON.stringify({ sid, upgrades: ["websocket"], pingInterval: 25000, pingTimeout: 60000 });
       res.writeHead(200, { "Content-Type": "text/plain; charset=UTF-8", "Access-Control-Allow-Origin": "*" });
       res.end(packet.length + ":" + packet);
@@ -259,15 +267,15 @@ var server = http.createServer((req, res) => {
 var wss = new wslib.WebSocketServer({ server, clientTracking: true });
 
 wss.on("connection", (ws, req) => {
-  const parsed = URL.parse(req.url, true);
+  const parsed = parseURL(req.url, req.headers.host);
   const path = parsed.pathname;
-  const query = parsed.query;
+  const query = parsed.searchParams;
 
   // Ecast WebSocket
   const ecastM = path.match(/^\/api\/v2\/rooms\/([A-Za-z]{4})\/play$/i);
   if (ecastM) {
     const code = ecastM[1].toUpperCase();
-    const isHost = query.role === "host" || query.joinAs === "host";
+    const isHost = query.get("role") === "host" || query.get("joinAs") === "host";
     handleEcastWS(ws, code, isHost, query);
     return;
   }
@@ -286,7 +294,7 @@ function handleEcastWS(ws, code, isHost, query) {
   if (isHost) {
     if (!ecastRooms[code]) {
       ecastRooms[code] = {
-        code, appTag: query.appTag || "unknown",
+        code, appTag: query.get("appTag") || "unknown",
         hostSocket: null, hostPC: 0,
         players: {}, playerCount: 0,
         blobs: {}, acls: {},
@@ -320,7 +328,7 @@ function handleEcastWS(ws, code, isHost, query) {
 
   room.playerCount++;
   const pid = String(room.playerCount + 1);
-  const name = query.name || `Player ${pid}`;
+  const name = query.get("name") || `Player ${pid}`;
   room.players[pid] = { socket: ws, id: pid, roles: { player: { name } }, name };
   console.log(`[Ecast] Player "${name}"(${pid}) joined ${code}`);
 
@@ -412,7 +420,7 @@ function handleEcastHostMsg(room, ws, m) {
 
 // ==================== BLOBCAST WS HANDLER ====================
 function handleBlobcastWS(ws, query) {
-  const sid = query.sid || genSID();
+  const sid = query.get("sid") || genSID();
   ws._bcSID = sid;
 
   ws.send(eioOpen(sid));
