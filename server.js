@@ -1,48 +1,97 @@
 /**
  * Jackbox Private Server v4
- * - Ecast / API v2  → plain WebSocket  (PP7+)
- * - Blobcast / API v1 → plain WebSocket with JSON frames (PP1-PP6)
+ * Implements Engine.IO v3 / Socket.IO v2 (EIO=3) for Blobcast (PP1-PP6)
+ * + plain WebSocket Ecast (PP7+)
  *
- * PP3 protocol (Joke Boat, Quiplash 2, TMP, Guesspionage, Tee K.O., Fakin' It):
- *   1. Game calls GET /room → gets { roomid, server, ... }
- *   2. Game connects WS to wss://<server>/socket/<roomid>?userId=...&appTag=...
- *   3. Players join via jackbox.tv → GET /room/<CODE> → WS to same server
+ * PP3 connection flow:
+ *  1. GET /room  → create room, returns {roomid, server, ...}
+ *  2. GET /socket.io/?EIO=3&transport=polling  → Engine.IO handshake
+ *  3. POST /socket.io/?EIO=3&transport=polling&sid=  → Socket.IO connect
+ *  4. WS /socket.io/?EIO=3&transport=websocket&sid=  → upgrade to WS
  */
 
 const http = require("http");
 const { WebSocketServer, WebSocket } = require("ws");
+const crypto = require("crypto");
 
-// ─── CONFIG ───────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 8080;
 const HOST = process.env.ACCESSIBLE_HOST
           || process.env.RENDER_EXTERNAL_HOSTNAME
           || "localhost";
 
-console.log(`Jackbox server v4 → host=${HOST} port=${PORT}`);
+console.log(`Jackbox v4 starting → ${HOST}:${PORT}`);
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
-const rooms = new Map();
+const rooms   = new Map(); // roomCode → Room
+const sioSess = new Map(); // sid → SioSession  (Engine.IO sessions)
 
+function randStr(n = 20) { return crypto.randomBytes(n).toString("base64url").slice(0, n); }
 function makeCode() {
   const c = "ABCDEFGHJKLMNPQRSTUVWXYZ";
-  let s = ""; for (let i = 0; i < 4; i++) s += c[Math.floor(Math.random() * c.length)]; return s;
+  let s = ""; for (let i = 0; i < 4; i++) s += c[Math.floor(Math.random() * c.length)];
+  return s;
 }
 function uniqueCode() { let c; do { c = makeCode(); } while (rooms.has(c)); return c; }
 
 function makeRoom(code, appTag, hostId) {
+  return { code, appTag: appTag||"unknown", hostId: hostId||null,
+           hostWs: null, clients: new Map(), locked: false,
+           state: null, created: Date.now() };
+}
+
+// ─── ENGINE.IO / SOCKET.IO PROTOCOL HELPERS ───────────────────────────────────
+// Engine.IO v3 packet types (sent as text over HTTP polling or WS)
+const EIO = { OPEN:0, CLOSE:1, PING:2, PONG:3, MESSAGE:4, UPGRADE:5, NOOP:6 };
+// Socket.IO v2 packet types (wrapped inside EIO MESSAGE)
+const SIO = { CONNECT:0, DISCONNECT:1, EVENT:2, ACK:3, ERROR:4, BINARY_EVENT:5 };
+
+// Encode Engine.IO polling frame: "LENGTH:PACKET..."
+function eioFrame(type, data) {
+  const s = `${type}${data || ""}`;
+  return `${s.length}:${s}`;
+}
+// Encode Socket.IO event inside Engine.IO message
+function sioEvent(namespace, event, ...args) {
+  return `${EIO.MESSAGE}${SIO.EVENT}${namespace ? namespace : ""}${JSON.stringify([event, ...args])}`;
+}
+
+// ─── SIO SESSION ──────────────────────────────────────────────────────────────
+function makeSioSession(sid, roomCode, userId, name, role) {
   return {
-    code, appTag: appTag || "unknown", appId: "jackbox-private-server",
-    hostId: hostId || null, hostWs: null,
-    locked: false, audienceEnabled: true, requiresPassword: false,
-    clients: new Map(), created: Date.now(), state: null,
+    sid, roomCode, userId, name, role,
+    ws: null,                // set when WS upgrade happens
+    pollQueue: [],           // outbound queue for polling
+    pollRes: null,           // pending GET response waiting for data
+    lastPing: Date.now(),
+    connected: false,
   };
 }
 
-function blobSend(ws, opcode, params) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  const msg = JSON.stringify({ seq: 0, opcode, params });
-  console.log(`  → SEND opcode=${opcode}`);
-  ws.send(msg);
+function sioSend(sess, event, ...args) {
+  const pkt = sioEvent("/", event, ...args);
+  const frame = eioFrame(EIO.MESSAGE, pkt.slice(1)); // pkt already starts with "4"
+  // Actually EIO MESSAGE is just the whole string: "4" + sio_packet
+  const full = `${EIO.MESSAGE}${SIO.EVENT}${JSON.stringify([event, ...args])}`;
+  if (sess.ws && sess.ws.readyState === WebSocket.OPEN) {
+    sess.ws.send(full);
+  } else {
+    sess.pollQueue.push(full);
+    flushPoll(sess);
+  }
+}
+
+function flushPoll(sess) {
+  if (!sess.pollRes || sess.pollQueue.length === 0) return;
+  const res = sess.pollRes;
+  sess.pollRes = null;
+  const frames = sess.pollQueue.splice(0).map(p => eioFrame(EIO.MESSAGE, p.slice(1)));
+  // Actually for polling we just send raw EIO frames concatenated
+  const body = sess.pollQueue.length === 0
+    ? frames.join("")
+    : frames.join("");
+  res.setHeader("Content-Type", "text/plain; charset=UTF-8");
+  res.writeHead(200);
+  res.end(frames.join(""));
 }
 
 // ─── HTTP SERVER ──────────────────────────────────────────────────────────────
@@ -52,132 +101,207 @@ const server = http.createServer((req, res) => {
 
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
-  res.setHeader("Content-Type", "application/json");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
-
-  // Full request logging
-  const ua = req.headers["user-agent"] || "";
-  console.log(`\nHTTP ${req.method} ${req.url}`);
-  console.log(`  UA: ${ua}`);
-  console.log(`  Query params: ${[...u.searchParams.entries()].map(([k,v])=>`${k}=${v}`).join(", ") || "(none)"}`);
 
   const readBody = () => new Promise(ok => {
     let b = ""; req.on("data", d => b += d); req.on("end", () => ok(b));
   });
 
-  // ══════════════════════════════════════════════════════
-  // BLOBCAST  (PP1–PP6)
-  // ══════════════════════════════════════════════════════
+  console.log(`HTTP ${req.method} ${req.url}`);
 
-  // GET /room  OR  POST /room  → create room
-  if (path === "/room") {
-    const handle = (data) => {
-      // Collect params from all possible sources
-      const appTag = data.appTag || data.apptag
-                  || u.searchParams.get("appTag") || u.searchParams.get("apptag")
-                  || "unknown";
-      const userId = data.userId || data.user_id
-                  || u.searchParams.get("userId") || u.searchParams.get("user_id")
-                  || makeCode();
-      const wantCode = data.roomId || data.roomid
-                    || u.searchParams.get("roomId") || u.searchParams.get("roomid");
+  // ══════════════════════════════════════════════════════
+  // ENGINE.IO / SOCKET.IO  (PP1-PP6 Blobcast)
+  // Path: /socket.io/  with EIO=3
+  // ══════════════════════════════════════════════════════
+  if (path === "/socket.io" || path === "/socket.io/") {
+    const eio       = u.searchParams.get("EIO") || "3";
+    const transport = u.searchParams.get("transport") || "polling";
+    const sid       = u.searchParams.get("sid");
+    const roomCode  = (u.searchParams.get("roomId") || u.searchParams.get("roomid") || "").toUpperCase();
+    const userId    = u.searchParams.get("userId") || u.searchParams.get("user_id") || randStr(8);
+    const name      = decodeURIComponent(u.searchParams.get("name") || "Player");
+    const role      = u.searchParams.get("role") || "player";
 
-      const code = (wantCode && /^[A-Z]{4}$/i.test(wantCode) && !rooms.has(wantCode.toUpperCase()))
+    // ── GET without sid → Engine.IO handshake ──────────────────────────────
+    if (req.method === "GET" && !sid) {
+      const newSid = randStr(20);
+      const sess = makeSioSession(newSid, roomCode, userId, name, role);
+      sioSess.set(newSid, sess);
+
+      // Associate with room
+      let room = rooms.get(roomCode);
+      if (!room && roomCode.length === 4) {
+        room = makeRoom(roomCode, "unknown", userId);
+        rooms.set(roomCode, room);
+        console.log(`[SIO] Auto-created room ${roomCode}`);
+      }
+      if (room) {
+        const isHost = role === "host" || !room.hostWs;
+        sess.role = isHost ? "host" : role;
+        room.clients.set(userId, sess);
+        if (isHost) room.hostWs = { send: (d) => sioSend(sess, "message", d), readyState: 1 };
+      }
+
+      const handshake = JSON.stringify({
+        sid: newSid,
+        upgrades: ["websocket"],
+        pingInterval: 25000,
+        pingTimeout:  5000,
+      });
+
+      // EIO v3 polling response: "LENGTH:0{handshake}LENGTH:40"
+      // 0 = OPEN packet, 40 = Socket.IO CONNECT to namespace "/"
+      const openPkt  = `0${handshake}`;
+      const connPkt  = `40`;
+      const body     = `${openPkt.length}:${openPkt}${connPkt.length}:${connPkt}`;
+
+      res.setHeader("Content-Type", "text/plain; charset=UTF-8");
+      res.writeHead(200);
+      res.end(body);
+      console.log(`[SIO] Handshake → sid=${newSid} room=${roomCode} role=${sess.role}`);
+
+      // Notify room host of new player
+      if (room && sess.role !== "host" && room.hostWs) {
+        setTimeout(() => {
+          const hostSess = [...sioSess.values()].find(s => s.roomCode === roomCode && s.role === "host");
+          if (hostSess) sioSend(hostSess, "client:joined", { userId, name, role: sess.role, roomid: roomCode });
+        }, 200);
+      }
+      return;
+    }
+
+    // ── GET with sid → long-poll waiting for data ─────────────────────────
+    if (req.method === "GET" && sid) {
+      const sess = sioSess.get(sid);
+      if (!sess) { res.writeHead(400); res.end("Unknown session"); return; }
+
+      // Send PING to keep alive
+      const pingFrame = `${EIO.PING.toString().length + 1}:${EIO.PING}`;
+
+      if (sess.pollQueue.length > 0) {
+        const frames = sess.pollQueue.splice(0).map(p => {
+          return `${p.length}:${p}`;
+        });
+        res.setHeader("Content-Type", "text/plain; charset=UTF-8");
+        res.writeHead(200);
+        res.end(frames.join(""));
+      } else {
+        // Hold connection open, send noop after 20s
+        sess.pollRes = res;
+        const timer = setTimeout(() => {
+          if (sess.pollRes === res) {
+            sess.pollRes = null;
+            const noop = `1:${EIO.NOOP}`;
+            res.setHeader("Content-Type", "text/plain; charset=UTF-8");
+            res.writeHead(200);
+            res.end(noop);
+          }
+        }, 20000);
+        req.on("close", () => { clearTimeout(timer); sess.pollRes = null; });
+      }
+      return;
+    }
+
+    // ── POST with sid → receive data from client ──────────────────────────
+    if (req.method === "POST" && sid) {
+      const sess = sioSess.get(sid);
+      readBody().then(body => {
+        if (!sess) { res.writeHead(400); res.end("ok"); return; }
+        // Parse EIO polling frame: "LENGTH:PACKET..."
+        handleSioData(sess, body);
+        res.setHeader("Content-Type", "text/plain; charset=UTF-8");
+        res.writeHead(200);
+        res.end("ok");
+      });
+      return;
+    }
+
+    res.writeHead(400);
+    res.end("Bad request");
+    return;
+  }
+
+  // ══════════════════════════════════════════════════════
+  // BLOBCAST HTTP  (room create/info)
+  // ══════════════════════════════════════════════════════
+  if (path === "/room" && (req.method === "GET" || req.method === "POST")) {
+    const handleRoom = (data) => {
+      const appTag = data.appTag || data.apptag || "unknown";
+      const userId = data.userId || data.user_id || randStr(8);
+      const wantCode = data.roomId || data.roomid;
+      const code = (wantCode && wantCode.length === 4 && !rooms.has(wantCode.toUpperCase()))
         ? wantCode.toUpperCase() : uniqueCode();
 
       const room = makeRoom(code, appTag, userId);
       rooms.set(code, room);
+      console.log(`[Blobcast] Room CREATED: ${code} appTag=${appTag}`);
 
-      // Response includes EVERY field any PP version might look for
-      const resp = {
-        // Room identifiers
+      res.setHeader("Content-Type", "application/json");
+      res.writeHead(200);
+      res.end(JSON.stringify({
         roomid: code, roomId: code,
-        // Server address — game will connect WS to this host
         server: HOST,
-        // App info
-        apptag: appTag, appTag: appTag,
-        appid: room.appId, appId: room.appId,
-        // Room state
+        apptag: appTag, appTag,
+        appid: "jackbox-private-server",
         numPlayers: 0, numAudience: 0,
-        audienceEnabled: true, requiresPassword: false,
+        audienceEnabled: true,
+        requiresPassword: false,
         locked: false, joinAs: "player",
-        // WebSocket info (different versions use different field names)
+        // Tell game where to find Socket.IO
         blobcastHost: HOST,
         blobcastPort: 443,
-        wsHost: HOST,
-        wsPort: 443,
-        host: HOST,
-        port: 443,
-        // Full URLs
-        wsUrl: `wss://${HOST}`,
-        socketUrl: `wss://${HOST}/socket/${code}`,
-        // Status
+        host: HOST, port: 443,
         error: "", success: true,
-      };
-
-      console.log(`[Blobcast] CREATED room=${code} appTag=${appTag} userId=${userId}`);
-      console.log(`  Response: ${JSON.stringify(resp)}`);
-      res.writeHead(200);
-      res.end(JSON.stringify(resp));
+      }));
     };
 
     if (req.method === "POST") {
       readBody().then(raw => {
         let data = {};
         try { data = JSON.parse(raw); } catch {}
-        console.log(`  Body: ${raw}`);
-        handle(data);
+        // Also check query params
+        if (!data.appTag) data.appTag = u.searchParams.get("appTag") || u.searchParams.get("apptag");
+        if (!data.userId) data.userId = u.searchParams.get("userId");
+        handleRoom(data);
       });
     } else {
-      handle({});
+      handleRoom({
+        appTag: u.searchParams.get("appTag") || u.searchParams.get("apptag"),
+        userId: u.searchParams.get("userId") || u.searchParams.get("user_id"),
+        roomId: u.searchParams.get("roomId"),
+      });
     }
     return;
   }
 
-  // GET /room/<CODE>  → room info for joining players
-  const blobRoomM = path.match(/^\/room\/([A-Za-z]{4})$/);
-  if (blobRoomM) {
-    const code = blobRoomM[1].toUpperCase();
+  const blobInfoM = path.match(/^\/room\/([A-Za-z]{4})$/);
+  if (blobInfoM) {
+    res.setHeader("Content-Type", "application/json");
+    const code = blobInfoM[1].toUpperCase();
     const room = rooms.get(code);
-    console.log(`[Blobcast] Room lookup: ${code} → ${room ? "found" : "NOT FOUND"}`);
-    if (!room) {
-      res.writeHead(404);
-      res.end(JSON.stringify({ roomid: null, error: "Room not found", success: false }));
-      return;
-    }
-    const resp = {
-      roomid: room.code, roomId: room.code,
-      server: HOST,
-      apptag: room.appTag, appTag: room.appTag,
-      appid: room.appId, appId: room.appId,
-      numPlayers: room.clients.size, numAudience: 0,
-      audienceEnabled: room.audienceEnabled,
-      requiresPassword: room.requiresPassword,
-      locked: room.locked, joinAs: room.locked ? "full" : "player",
-      blobcastHost: HOST, blobcastPort: 443,
-      host: HOST, port: 443,
-      wsUrl: `wss://${HOST}`,
-      socketUrl: `wss://${HOST}/socket/${code}`,
-      error: "", success: true,
-    };
-    res.writeHead(200);
-    res.end(JSON.stringify(resp));
-    return;
-  }
-
-  // ══════════════════════════════════════════════════════
-  // ECAST  (PP7+, API v2)
-  // ══════════════════════════════════════════════════════
-
-  if (path.match(/^\/api\/v2\/app-configs\//)) {
-    const appTag = path.split("/").pop().split("?")[0];
+    if (!room) { res.writeHead(404); res.end(JSON.stringify({ roomid: null, success: false })); return; }
     res.writeHead(200);
     res.end(JSON.stringify({
-      appTag, serverUrl: `wss://${HOST}`,
-      blobcastHost: `https://${HOST}`, isTestServer: false,
+      roomid: room.code, server: HOST,
+      apptag: room.appTag, locked: room.locked,
+      numPlayers: room.clients.size, numAudience: 0,
+      audienceEnabled: true, requiresPassword: false,
+      joinAs: room.locked ? "full" : "player",
+      success: true, error: "",
     }));
+    return;
+  }
+
+  // ══════════════════════════════════════════════════════
+  // ECAST  (PP7+)
+  // ══════════════════════════════════════════════════════
+  if (path.match(/^\/api\/v2\/app-configs\//)) {
+    const appTag = path.split("/").pop();
+    res.setHeader("Content-Type", "application/json");
+    res.writeHead(200);
+    res.end(JSON.stringify({ appTag, serverUrl: `wss://${HOST}`, blobcastHost: `https://${HOST}`, isTestServer: false }));
     return;
   }
 
@@ -186,224 +310,239 @@ const server = http.createServer((req, res) => {
       let data = {}; try { data = JSON.parse(raw); } catch {}
       const code = uniqueCode();
       rooms.set(code, makeRoom(code, data.appTag || "unknown", data.userId));
+      res.setHeader("Content-Type", "application/json");
       res.writeHead(200);
       res.end(JSON.stringify({ roomId: code, code, host: `wss://${HOST}`, success: true }));
     });
     return;
   }
 
-  const ecastRoomM = path.match(/^\/api\/v2\/rooms\/([A-Za-z]{4})$/);
-  if (ecastRoomM) {
-    const code = ecastRoomM[1].toUpperCase();
+  const ecastInfoM = path.match(/^\/api\/v2\/rooms\/([A-Za-z]{4})$/);
+  if (ecastInfoM) {
+    const code = ecastInfoM[1].toUpperCase();
     const room = rooms.get(code);
+    res.setHeader("Content-Type", "application/json");
     if (!room) { res.writeHead(404); res.end(JSON.stringify({ error: "Not found" })); return; }
     res.writeHead(200);
-    res.end(JSON.stringify({
-      roomId: room.code, appTag: room.appTag, locked: room.locked,
-      players: [...room.clients.values()].map(c => ({ id: c.id, name: c.name })),
-    }));
+    res.end(JSON.stringify({ roomId: room.code, appTag: room.appTag, locked: room.locked }));
     return;
   }
 
-  // Health
+  // Fallback
+  console.log(`[UNKNOWN] ${req.method} ${path}`);
+  res.setHeader("Content-Type", "application/json");
   res.writeHead(200);
-  res.end(JSON.stringify({
-    ok: true, host: HOST, rooms: rooms.size,
-    roomList: [...rooms.keys()],
-  }));
+  res.end(JSON.stringify({ ok: true, host: HOST, rooms: rooms.size }));
 });
 
-// ─── BLOBCAST WEBSOCKET ───────────────────────────────────────────────────────
-const blobWss = new WebSocketServer({ noServer: true });
-
-blobWss.on("connection", (ws, req, code) => {
-  const u      = new URL(req.url, `http://${req.headers.host}`);
-  const userId = u.searchParams.get("userId") || u.searchParams.get("user_id") || makeCode();
-  const name   = decodeURIComponent(u.searchParams.get("name") || "");
-  const role   = u.searchParams.get("role") || "";
-  const appTag = u.searchParams.get("appTag") || u.searchParams.get("apptag") || "";
-
-  let room = rooms.get(code);
-  if (!room) {
-    room = makeRoom(code, appTag || "unknown", userId);
-    rooms.set(code, room);
-    console.log(`[Blobcast][${code}] Auto-created room on WS connect`);
+// ─── SOCKET.IO MESSAGE HANDLER ────────────────────────────────────────────────
+function handleSioData(sess, raw) {
+  // Parse EIO polling frames: "LEN:PACKET LEN:PACKET ..."
+  let i = 0;
+  while (i < raw.length) {
+    const colon = raw.indexOf(":", i);
+    if (colon === -1) break;
+    const len = parseInt(raw.slice(i, colon));
+    if (isNaN(len)) break;
+    const pkt = raw.slice(colon + 1, colon + 1 + len);
+    i = colon + 1 + len;
+    processEioPkt(sess, pkt);
   }
+  // If no framing (raw socket.io packet directly)
+  if (i === 0) processEioPkt(sess, raw);
+}
 
-  // First connected client with no existing hostWs is the host
-  const isHost = role === "host" || (!room.hostWs && room.clients.size === 0)
-              || userId === room.hostId;
-  if (isHost && !room.hostWs) {
-    room.hostWs = ws;
-    room.hostId = userId;
+function processEioPkt(sess, pkt) {
+  if (!pkt || pkt.length === 0) return;
+  const eioType = parseInt(pkt[0]);
+  const data    = pkt.slice(1);
+  console.log(`[SIO][${sess.sid.slice(0,6)}] EIO type=${eioType} data=${data.slice(0,100)}`);
+
+  if (eioType === EIO.PONG) { sess.lastPing = Date.now(); return; }
+  if (eioType === EIO.PING) {
+    // Send pong back
+    sioSend(sess, "pong", {});
+    return;
   }
+  if (eioType !== EIO.MESSAGE) return;
 
-  const client = { ws, id: userId, name, role: isHost ? "host" : (role || "player") };
-  room.clients.set(userId, client);
+  // Socket.IO packet inside EIO message
+  const sioType = parseInt(data[0]);
+  const payload = data.slice(1);
 
-  console.log(`\n[Blobcast][${code}] ${isHost?"HOST":"PLAYER"} CONNECTED`);
-  console.log(`  userId=${userId} name="${name}" role=${role} appTag=${appTag}`);
-  console.log(`  Room now has ${room.clients.size} clients`);
+  if (sioType === SIO.CONNECT) { sess.connected = true; return; }
+  if (sioType === SIO.DISCONNECT) { cleanupSess(sess); return; }
+  if (sioType !== SIO.EVENT) return;
 
-  // Welcome message
-  blobSend(ws, "ok", {
-    roomId: code, roomid: code,
-    server: HOST, userId,
-    // Some PP versions need "connected" confirmation
-    connected: true,
-  });
+  // Parse Socket.IO event: [eventName, ...args]
+  let args = [];
+  try {
+    // Remove namespace prefix if present (e.g. "/," → skip to "[")
+    const jsonStart = payload.indexOf("[");
+    args = JSON.parse(payload.slice(jsonStart));
+  } catch { return; }
 
-  // Send existing room state to new player
-  if (!isHost && room.state !== null) {
-    blobSend(ws, "object", { key: "bc:room", val: room.state });
-  }
+  const [event, ...rest] = args;
+  console.log(`[SIO][${sess.sid.slice(0,6)}][${sess.role}] event=${event}`);
+  handleSioEvent(sess, event, rest[0]);
+}
 
-  // Notify host of new player
-  if (!isHost && room.hostWs) {
-    blobSend(room.hostWs, "client:joined", {
-      userId, name, role: client.role, roomid: code,
-    });
-  }
+function handleSioEvent(sess, event, data) {
+  const room = rooms.get(sess.roomCode);
+  if (!room) return;
+  const isHost = sess.role === "host";
 
-  ws.on("message", raw => {
-    const str = raw.toString().trim();
-    console.log(`\n[Blobcast][${code}][${isHost?"H":"P"}] RAW IN: ${str.substring(0, 300)}`);
-
-    let seq = 0, opcode = "", params = {};
-
-    if (str.startsWith("{")) {
-      try {
-        const obj = JSON.parse(str);
-        seq    = obj.seq    || 0;
-        opcode = obj.opcode || obj.type || obj.key || "";
-        params = obj.params !== undefined ? obj.params : (obj.body || obj);
-        if (!opcode && obj.key) { opcode = "object"; params = obj; }
-      } catch (e) {
-        console.log(`  JSON parse error: ${e.message}`);
-        return;
+  switch (event) {
+    case "bc:room":
+    case "object":
+      if (data && data.key === "bc:room") {
+        room.state = data.val;
+        broadcastSio(room, sess, "object", { key: "bc:room", val: room.state });
+      } else if (isHost) {
+        broadcastSio(room, sess, event, data);
+      } else {
+        const host = getHostSess(room);
+        if (host) sioSend(host, event, { ...data, userId: sess.userId, name: sess.name });
       }
-    } else if (str.includes("\t")) {
-      const parts = str.split("\t");
-      seq    = parseInt(parts[0]) || 0;
-      opcode = parts[1] || "";
-      try { params = parts.length > 2 ? JSON.parse(parts.slice(2).join("\t")) : {}; } catch {}
-    } else {
-      console.log(`  Unknown frame format, skipping`);
-      return;
-    }
+      break;
 
-    if (!opcode) return;
-    console.log(`  opcode=${opcode} seq=${seq} params=${JSON.stringify(params).substring(0,200)}`);
-
-    switch (opcode) {
-
-      case "object":
-        if (params && params.key === "bc:room") {
-          room.state = params.val;
-          console.log(`  [state] bc:room updated`);
-          broadcastBlob(room, ws, "object", { key: "bc:room", val: room.state });
-        } else if (params && params.key && params.key.startsWith("bc:client")) {
-          if (room.hostWs) blobSend(room.hostWs, "object", { ...params, userId });
-        } else if (isHost) {
-          broadcastBlob(room, ws, "object", params);
+    case "send":
+    case "msg":
+      if (isHost) {
+        const to = data && data.to;
+        if (to) {
+          const target = [...sioSess.values()].find(s => s.userId === to && s.roomCode === sess.roomCode);
+          if (target) sioSend(target, "msg", { from: "server", body: data.body || data });
         } else {
-          if (room.hostWs) blobSend(room.hostWs, "object", { ...params, userId, name });
+          broadcastSio(room, sess, "msg", { from: "server", body: data && (data.body || data) });
         }
-        break;
-
-      case "send":
-      case "bc:send":
-        if (isHost) {
-          const to = params && (params.to || params.userId);
-          if (to) {
-            const tc = room.clients.get(to);
-            if (tc) blobSend(tc.ws, "msg", { from: "server", body: params.body || params });
-          } else {
-            broadcastBlob(room, ws, "msg", { from: "server", body: params && (params.body || params) });
-          }
-        } else {
-          if (room.hostWs) blobSend(room.hostWs, "msg", { from: userId, userId, name, body: params });
-        }
-        break;
-
-      case "msg":
-      case "text":
-        if (isHost) {
-          broadcastBlob(room, ws, opcode, params);
-        } else {
-          if (room.hostWs) blobSend(room.hostWs, "msg", { from: userId, userId, name, body: params });
-        }
-        break;
-
-      case "lock":
-        room.locked = params && params.lock !== false;
-        broadcastBlob(room, null, "lock", { locked: room.locked, roomid: code });
-        break;
-
-      case "kick": {
-        const kId = params && (params.userId || params.userid);
-        const kc = kId && room.clients.get(kId);
-        if (kc) {
-          blobSend(kc.ws, "kicked", { reason: (params && params.reason) || "Kicked by host" });
-          kc.ws.close();
-          room.clients.delete(kId);
-        }
-        break;
+      } else {
+        const host = getHostSess(room);
+        if (host) sioSend(host, "msg", { from: sess.userId, userId: sess.userId, name: sess.name, body: data });
       }
+      break;
 
-      default:
-        if (isHost) {
-          broadcastBlob(room, ws, opcode, params);
-        } else {
-          if (room.hostWs) blobSend(room.hostWs, opcode, { userId, name, ...(params||{}) });
-        }
-    }
-  });
+    case "lock":
+      room.locked = data && data.lock !== false;
+      broadcastSio(room, null, "lock", { locked: room.locked, roomid: room.code });
+      break;
 
-  ws.on("close", (code_, reason) => {
-    room.clients.delete(userId);
-    console.log(`\n[Blobcast][${code}] ${isHost?"HOST":"PLAYER"} DISCONNECTED userId=${userId} code=${code_}`);
-    if (isHost) {
-      room.hostWs = null;
-      broadcastBlob(room, null, "server:disconnected", { reason: "Host left" });
-    } else {
-      if (room.hostWs) blobSend(room.hostWs, "client:left", { userId, name });
-      broadcastBlob(room, ws, "client:left", { userId, name });
-    }
-    if (room.clients.size === 0) {
-      setTimeout(() => { if (rooms.get(code)?.clients.size === 0) rooms.delete(code); }, 30000);
-    }
-  });
-
-  ws.on("error", e => console.error(`[Blobcast][${code}] WS error: ${e.message}`));
-});
-
-function broadcastBlob(room, skipWs, opcode, params) {
-  for (const [, c] of room.clients) {
-    if (c.ws === skipWs) continue;
-    blobSend(c.ws, opcode, params);
+    default:
+      if (isHost) {
+        broadcastSio(room, sess, event, data);
+      } else {
+        const host = getHostSess(room);
+        if (host) sioSend(host, event, { userId: sess.userId, name: sess.name, ...data });
+      }
   }
 }
 
-// ─── ECAST WEBSOCKET ──────────────────────────────────────────────────────────
-const ecastWss = new WebSocketServer({ noServer: true });
+function getHostSess(room) {
+  return [...sioSess.values()].find(s => s.roomCode === room.code && s.role === "host");
+}
 
+function broadcastSio(room, skipSess, event, data) {
+  for (const [, s] of sioSess) {
+    if (s.roomCode !== room.code) continue;
+    if (s === skipSess) continue;
+    sioSend(s, event, data);
+  }
+}
+
+function cleanupSess(sess) {
+  const room = rooms.get(sess.roomCode);
+  if (room) {
+    room.clients.delete(sess.userId);
+    if (sess.role === "host") {
+      room.hostWs = null;
+      broadcastSio(room, null, "server:disconnected", { reason: "Host left" });
+    } else {
+      const host = getHostSess(room);
+      if (host) sioSend(host, "client:left", { userId: sess.userId, name: sess.name });
+    }
+  }
+  sioSess.delete(sess.sid);
+}
+
+// ─── WEBSOCKET UPGRADE ────────────────────────────────────────────────────────
+const sioWss   = new WebSocketServer({ noServer: true }); // Socket.IO upgrade
+const ecastWss = new WebSocketServer({ noServer: true }); // Ecast plain WS
+const blobWss  = new WebSocketServer({ noServer: true }); // plain Blobcast WS
+
+// Socket.IO WebSocket upgrade handler
+sioWss.on("connection", (ws, req) => {
+  const u   = new URL(req.url, `http://${req.headers.host}`);
+  const sid = u.searchParams.get("sid");
+  const sess = sid ? sioSess.get(sid) : null;
+
+  if (!sess) {
+    // New connection without prior polling handshake
+    const roomCode = (u.searchParams.get("roomId") || u.searchParams.get("roomid") || "").toUpperCase();
+    const userId   = u.searchParams.get("userId") || randStr(8);
+    const name     = decodeURIComponent(u.searchParams.get("name") || "Player");
+    const role     = u.searchParams.get("role") || "player";
+    const newSid   = randStr(20);
+    const newSess  = makeSioSession(newSid, roomCode, userId, name, role);
+    newSess.ws = ws;
+    newSess.connected = true;
+    sioSess.set(newSid, newSess);
+
+    let room = rooms.get(roomCode);
+    if (!room && roomCode.length === 4) { room = makeRoom(roomCode,"unknown",userId); rooms.set(roomCode,room); }
+    if (room) {
+      const isHost = role === "host" || !room.hostWs;
+      newSess.role = isHost ? "host" : role;
+      room.clients.set(userId, newSess);
+    }
+
+    // Send EIO OPEN + SIO CONNECT
+    const handshake = JSON.stringify({ sid: newSid, upgrades: [], pingInterval: 25000, pingTimeout: 5000 });
+    ws.send(`0${handshake}`);
+    ws.send(`40`);
+    console.log(`[SIO-WS] New direct WS sess=${newSid} room=${roomCode} role=${newSess.role}`);
+    handleWsMessages(ws, newSess);
+    return;
+  }
+
+  // Existing session upgrading from polling to WS
+  sess.ws = ws;
+  console.log(`[SIO-WS] Upgraded sess=${sid.slice(0,6)} room=${sess.roomCode}`);
+  // Send EIO UPGRADE ack
+  ws.send(`5`); // UPGRADE packet
+  handleWsMessages(ws, sess);
+});
+
+function handleWsMessages(ws, sess) {
+  ws.on("message", raw => {
+    const str = raw.toString();
+    processEioPkt(sess, str);
+  });
+  // Ping/pong keepalive
+  const pingInterval = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) ws.send(`2`); // PING
+  }, 25000);
+  ws.on("close", () => {
+    clearInterval(pingInterval);
+    cleanupSess(sess);
+  });
+  ws.on("error", e => console.error(`[SIO-WS] error:`, e.message));
+}
+
+// Ecast (PP7+) plain WebSocket
 ecastWss.on("connection", (ws, req, code) => {
   const u      = new URL(req.url, `http://${req.headers.host}`);
-  const userId = u.searchParams.get("userId") || makeCode();
+  const userId = u.searchParams.get("userId") || randStr(8);
   const name   = decodeURIComponent(u.searchParams.get("name") || "Player");
   const role   = u.searchParams.get("role") || "player";
 
-  const room = rooms.get(code);
+  let room = rooms.get(code);
   if (!room) { ws.close(4004, "Room not found"); return; }
 
   const isHost = role === "host" || userId === room.hostId;
   if (isHost) room.hostWs = ws;
   room.clients.set(userId, { ws, id: userId, name, role });
 
-  console.log(`[Ecast][${code}] ${isHost?"HOST":"PLAYER"} connected: ${name}`);
   ws.send(JSON.stringify({ opcode: "connected", userId, roomId: code }));
-
   if (!isHost && room.hostWs?.readyState === WebSocket.OPEN)
     room.hostWs.send(JSON.stringify({ opcode: "client/join", userId, name, role }));
 
@@ -413,14 +552,13 @@ ecastWss.on("connection", (ws, req, code) => {
     if (isHost) {
       const fwd = op.replace(/^bc\/server\//, "bc/client/");
       for (const [, c] of room.clients) {
-        if (c.ws !== ws && c.ws.readyState === WebSocket.OPEN)
+        if (c.ws !== ws && c.ws?.readyState === WebSocket.OPEN)
           c.ws.send(JSON.stringify({ opcode: fwd, ...(msg.params || {}) }));
       }
     } else if (room.hostWs?.readyState === WebSocket.OPEN) {
       room.hostWs.send(JSON.stringify({ opcode: op, userId, name, ...(msg.params || {}) }));
     }
   });
-
   ws.on("close", () => {
     room.clients.delete(userId);
     if (isHost) room.hostWs = null;
@@ -429,73 +567,107 @@ ecastWss.on("connection", (ws, req, code) => {
   });
 });
 
+// Plain Blobcast WS (fallback for any WS that isn't Socket.IO or Ecast)
+blobWss.on("connection", (ws, req, code) => {
+  const u      = new URL(req.url, `http://${req.headers.host}`);
+  const userId = u.searchParams.get("userId") || randStr(8);
+  const name   = decodeURIComponent(u.searchParams.get("name") || "Player");
+  const role   = u.searchParams.get("role") || "player";
+
+  let room = rooms.get(code);
+  if (!room) { room = makeRoom(code, "unknown", userId); rooms.set(code, room); }
+
+  const isHost = role === "host" || !room.hostWs;
+  if (isHost) room.hostWs = ws;
+  room.clients.set(userId, { ws, id: userId, name, role: isHost?"host":role });
+
+  const send = (op, params) => {
+    if (ws.readyState === WebSocket.OPEN)
+      ws.send(JSON.stringify({ seq:0, opcode: op, params }));
+  };
+
+  send("ok", { roomid: code, server: HOST, userId });
+  if (!isHost && room.state) send("object", { key: "bc:room", val: room.state });
+
+  ws.on("message", raw => {
+    let op = "", params = {};
+    try {
+      const obj = JSON.parse(raw.toString());
+      op = obj.opcode || obj.type || ""; params = obj.params || obj.body || {};
+    } catch { return; }
+    if (isHost) {
+      for (const [, c] of room.clients) {
+        if (c.ws !== ws && c.ws?.readyState === WebSocket.OPEN)
+          c.ws.send(JSON.stringify({ seq:0, opcode: op, params }));
+      }
+    } else if (room.hostWs?.readyState === WebSocket.OPEN) {
+      room.hostWs.send(JSON.stringify({ seq:0, opcode: op, params: { ...params, userId, name } }));
+    }
+  });
+  ws.on("close", () => {
+    room.clients.delete(userId);
+    if (isHost) room.hostWs = null;
+  });
+});
+
 // ─── UPGRADE ROUTING ──────────────────────────────────────────────────────────
 server.on("upgrade", (req, socket, head) => {
   const u    = new URL(req.url, `http://${req.headers.host}`);
   const path = u.pathname;
-  const ua   = req.headers["user-agent"] || "";
+  console.log(`WS Upgrade: ${path}${u.search}`);
 
-  console.log(`\nWS UPGRADE: ${path}${u.search}`);
-  console.log(`  UA: ${ua}`);
-  console.log(`  Origin: ${req.headers.origin || "(none)"}`);
-  console.log(`  Query: ${[...u.searchParams.entries()].map(([k,v])=>`${k}=${v}`).join(", ") || "(none)"}`);
+  // Socket.IO (EIO=3 or EIO=4 with transport=websocket)
+  if (path === "/socket.io" || path === "/socket.io/") {
+    sioWss.handleUpgrade(req, socket, head, ws => sioWss.emit("connection", ws, req));
+    return;
+  }
 
-  // Ecast: /api/v2/rooms/CODE  or  /api/v2/rooms/CODE/play
+  // Ecast: /api/v2/rooms/CODE or /api/v2/rooms/CODE/play
   const ecastM = path.match(/\/api\/v2\/rooms\/([A-Za-z]{4})(\/play)?$/i);
   if (ecastM) {
     const code = ecastM[1].toUpperCase();
-    console.log(`  → ECAST room=${code}`);
     ecastWss.handleUpgrade(req, socket, head, ws => ecastWss.emit("connection", ws, req, code));
     return;
   }
 
-  // Blobcast path: /socket/CODE  /room/CODE  /play/CODE  /csp/CODE  /live/CODE  /blobcast/CODE
-  const blobPathM = path.match(/^\/(socket|room|play|blobcast|bc|csp|live|game)\/?([A-Za-z]{4})/i);
-  if (blobPathM) {
-    const code = blobPathM[2].toUpperCase();
-    console.log(`  → BLOBCAST room=${code} (path match on /${blobPathM[1]}/)`);
+  // Plain Blobcast WS: /socket/CODE  /room/CODE  /play/CODE
+  const blobM = path.match(/^\/(socket|room|play|blobcast|bc|csp)\/([A-Za-z]{4})/i);
+  if (blobM) {
+    const code = blobM[2].toUpperCase();
     blobWss.handleUpgrade(req, socket, head, ws => blobWss.emit("connection", ws, req, code));
     return;
   }
 
-  // Blobcast: roomId in query
-  const rid = u.searchParams.get("roomId") || u.searchParams.get("roomid")
-           || u.searchParams.get("room_id") || u.searchParams.get("code");
+  // Query param roomId
+  const rid = u.searchParams.get("roomId") || u.searchParams.get("roomid");
   if (rid?.match(/^[A-Za-z]{4}$/)) {
     const code = rid.toUpperCase();
-    console.log(`  → BLOBCAST room=${code} (query param)`);
     blobWss.handleUpgrade(req, socket, head, ws => blobWss.emit("connection", ws, req, code));
     return;
   }
 
-  // Blobcast: 4-letter CODE anywhere in path
-  const codeM = path.match(/\/([A-Z]{4})(\/|$)/);
-  if (codeM) {
-    const code = codeM[1];
-    console.log(`  → BLOBCAST room=${code} (code in path)`);
-    blobWss.handleUpgrade(req, socket, head, ws => blobWss.emit("connection", ws, req, code));
-    return;
-  }
-
-  console.warn(`  ✗ No route matched — destroying socket`);
+  console.warn(`WS: no route for ${path} — destroying`);
   socket.destroy();
 });
 
 // ─── CLEANUP ──────────────────────────────────────────────────────────────────
 setInterval(() => {
   const now = Date.now();
-  for (const [code, room] of rooms)
-    if (now - room.created > 4 * 3600_000) rooms.delete(code);
-}, 300_000);
+  for (const [k, s] of sioSess) if (now - s.lastPing > 120000) sioSess.delete(k);
+  for (const [k, r] of rooms)   if (now - r.created > 4*3600000) rooms.delete(k);
+}, 60000);
 
-// ─── START ────────────────────────────────────────────────────────────────────
 server.listen(PORT, () => {
   console.log(`
 ╔══════════════════════════════════════════════════╗
-║     Jackbox Private Server v4 Running            ║
+║      Jackbox Private Server v4 — LIVE!           ║
 ╠══════════════════════════════════════════════════╣
-║  Blobcast PP1-PP6:  GET https://${HOST}/room ║
-║  Ecast PP7+:        wss://${HOST}/api/v2/... ║
+║  Blobcast/Socket.IO (PP1-PP6):                   ║
+║    GET  https://${HOST}/room              ║
+║    WS   wss://${HOST}/socket.io/          ║
+║                                                  ║
+║  Ecast plain WS (PP7-PP10+):                     ║
+║    WS   wss://${HOST}/api/v2/rooms/X/play ║
 ╚══════════════════════════════════════════════════╝
   `);
 });
