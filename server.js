@@ -1,637 +1,530 @@
-/*
- * ============================================================
- *  Jackbox ALL-IN-ONE Private Server
- * ============================================================
- *  Протоколы:
- *   - Ecast  / API v2  -> Party Pack 7, 8, Drawful 2 Intl
- *   - Blobcast / API v1 -> Party Pack 1-6, Fibbage, Quiplash
+/**
+ * Jackbox Private Server
+ * Supports:
+ *   - Ecast / API v2  (Party Pack 7, 8, Drawful 2 International, etc.)
+ *   - Blobcast / API v1 (Party Pack 1-6, Fibbage 1/2, Quiplash 1/2, etc.)
  *
- *  Роутинг на одном HTTP-сервере:
- *   /api/v2/*       -> Ecast (новый протокол)
- *   /room/*         -> Blobcast REST (старый протокол)
- *   /socket.io/*    -> Blobcast WebSocket (socket.io-v1)
- *   /               -> статус сервера
- * ============================================================
+ * Deploy to Render: set Start Command = "node server.js"
  */
 
-var http = require("http");
-var wslib = require("ws");
+const http = require("http");
+const https = require("https");
+const { WebSocketServer, WebSocket } = require("ws");
 
-// Парсим URL через современный WHATWG URL API (без deprecated url.parse)
-function parseURL(reqUrl, baseHost) {
-  try {
-    return new URL(reqUrl, `http://${baseHost || "localhost"}`);
-  } catch(e) {
-    return new URL("http://localhost/");
-  }
-}
-
-// ==================== CONFIG ====================
+// ─── CONFIG ──────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 8080;
-const RENDER_URL = process.env.RENDER_EXTERNAL_URL || null;
+// On Render this is auto-assigned; set to your onrender.com URL in env var
+const HOST = process.env.ACCESSIBLE_HOST || process.env.RENDER_EXTERNAL_HOSTNAME || "localhost";
+const USE_HTTPS = process.env.USE_HTTPS === "true"; // Render handles TLS for us
 
-const ACCESSIBLE_HOST = RENDER_URL
-  ? RENDER_URL.replace(/^https?:\/\//, "").replace(/\/$/, "")
-  : process.env.HOST || `localhost:${PORT}`;
+console.log(`Starting Jackbox server on ${HOST}:${PORT}`);
 
-const USE_SECURE = !!RENDER_URL;
-const WS_PROTO = USE_SECURE ? "wss" : "ws";
+// ─── SHARED STATE ─────────────────────────────────────────────────────────────
+// Blobcast rooms:  roomCode -> { host, clients, appTag, state, ... }
+const blobcastRooms = new Map();
+// Ecast rooms:     roomCode -> { host, audience, clients, appTag, state, ... }
+const ecastRooms   = new Map();
 
-console.log(`\n🎮 Jackbox All-in-One Server`);
-console.log(`   Host    : ${ACCESSIBLE_HOST}`);
-console.log(`   Secure  : ${USE_SECURE}`);
-console.log(`   Port    : ${PORT}\n`);
-
-// ==================== ROOM STORES ====================
-var ecastRooms = {};   // Ecast rooms (PP7, PP8)
-var blobRooms = {};    // Blobcast rooms (PP1-PP6)
-var sidToRoom = {};    // blobcast: sid -> { code, isHost }
-
-// ==================== SHARED HELPERS ====================
-function genCode(store) {
+function randomRoomCode() {
   const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ";
   let code = "";
   for (let i = 0; i < 4; i++) code += chars[Math.floor(Math.random() * chars.length)];
-  return store[code] ? genCode(store) : code;
+  return code;
+}
+function uniqueRoomCode(map) {
+  let code;
+  do { code = randomRoomCode(); } while (map.has(code));
+  return code;
 }
 
-function genSID() {
-  return Math.random().toString(36).substr(2, 10) + Math.random().toString(36).substr(2, 10);
-}
+// ─── HTTP SERVER ──────────────────────────────────────────────────────────────
+const httpServer = http.createServer((req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const path = url.pathname;
 
-// ==================== ECAST HELPERS ====================
-function ecastCreateRoom(appTag) {
-  const code = genCode(ecastRooms);
-  ecastRooms[code] = {
-    code, appTag,
-    hostSocket: null, hostPC: 0,
-    players: {}, playerCount: 0,
-    blobs: {}, acls: {},
-    locked: false, created: Date.now(),
-  };
-  console.log(`[Ecast] Room created: ${code} (${appTag})`);
-  return ecastRooms[code];
-}
-
-function ecastSendHostOk(room, ws, seq) {
-  if (!ws || ws.readyState !== wslib.WebSocket.OPEN) return;
-  ws.send(JSON.stringify({ pc: ++room.hostPC, re: seq, opcode: "ok", result: {} }));
-}
-
-function ecastBroadcastPlayers(room, message) {
-  const msg = JSON.stringify(message);
-  for (const pid in room.players) {
-    const p = room.players[pid];
-    if (p.socket.readyState === wslib.WebSocket.OPEN) p.socket.send(msg);
-  }
-}
-
-// ==================== BLOBCAST / ENGINE.IO HELPERS ====================
-function eioOpen(sid) {
-  return "0" + JSON.stringify({
-    sid, upgrades: ["websocket"],
-    pingInterval: 25000, pingTimeout: 60000,
-  });
-}
-
-function sioEvent(name, data) {
-  return "42" + JSON.stringify([name, data]);
-}
-
-function sioAck(id, data) {
-  return "43" + id + JSON.stringify([data]);
-}
-
-function sendSIO(ws, event, data) {
-  if (!ws || ws.readyState !== wslib.WebSocket.OPEN) return;
-  try { ws.send(sioEvent(event, data)); } catch(e) {}
-}
-
-function blobCreateRoom(appTag) {
-  const code = genCode(blobRooms);
-  blobRooms[code] = {
-    code, appTag,
-    hostSocket: null, hostSID: null,
-    players: {}, blobs: {},
-    seq: 0, locked: false, created: Date.now(),
-  };
-  console.log(`[Blobcast] Room created: ${code} (${appTag})`);
-  return blobRooms[code];
-}
-
-// ==================== HTTP SERVER ====================
-var server = http.createServer((req, res) => {
-  const parsed = parseURL(req.url, req.headers.host);
-  const path = parsed.pathname;
-
+  res.setHeader("Content-Type", "application/json");
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+  if (req.method === "OPTIONS") { res.writeHead(200); res.end(); return; }
 
-  // ---- ECAST: POST /api/v2/rooms ----
+  console.log(`HTTP: ${req.method} ${path}`);
+
+  // ── Ecast / API v2 ──────────────────────────────────────────────────────────
+
+  // App config
+  if (path.match(/^\/api\/v2\/app-configs\//)) {
+    const appTag = path.split("/").pop().split("?")[0];
+    res.writeHead(200);
+    res.end(JSON.stringify({
+      appTag,
+      blobcastHost: `${USE_HTTPS ? "https" : "http"}://${HOST}`,
+      blobcastPort: PORT,
+      serverUrl:    `${USE_HTTPS ? "wss" : "ws"}://${HOST}`,
+      isTestServer: false,
+    }));
+    return;
+  }
+
+  // Create Ecast room
   if (path === "/api/v2/rooms" && req.method === "POST") {
     let body = "";
-    req.on("data", c => body += c);
+    req.on("data", d => body += d);
     req.on("end", () => {
-      let appTag = "unknown";
-      try { appTag = JSON.parse(body).appTag || appTag; } catch(e) {}
-      const room = ecastCreateRoom(appTag);
-      res.writeHead(200, { "Content-Type": "application/json" });
+      let data = {};
+      try { data = JSON.parse(body); } catch {}
+
+      const code = uniqueRoomCode(ecastRooms);
+      ecastRooms.set(code, {
+        code,
+        appTag:  data.appTag  || "unknown",
+        userId:  data.userId  || null,
+        host:    null,
+        clients: new Map(),
+        audience: new Map(),
+        locked:  false,
+        created: Date.now(),
+        state:   {},
+      });
+
+      res.writeHead(200);
       res.end(JSON.stringify({
-        ok: true,
-        body: {
-          host: `${WS_PROTO}://${ACCESSIBLE_HOST}/api/v2/rooms/${room.code}/play`,
-          code: room.code,
-          joinAs: "host",
-          token: `host_${room.code}`,
-          successUrl: `${WS_PROTO}://${ACCESSIBLE_HOST}/api/v2/rooms/${room.code}/play`,
-        },
+        roomId: code,
+        host:   `${USE_HTTPS ? "wss" : "ws"}://${HOST}`,
+        port:   PORT,
+        code,
       }));
     });
     return;
   }
 
-  // ---- ECAST: GET /api/v2/rooms/:code ----
-  const ecastRoomM = path.match(/^\/api\/v2\/rooms\/([A-Za-z]{4})$/i);
-  if (ecastRoomM) {
-    const code = ecastRoomM[1].toUpperCase();
-    const room = ecastRooms[code];
-    if (!room) { res.writeHead(404); res.end(JSON.stringify({ ok: false, error: "not found" })); return; }
-    res.writeHead(200, { "Content-Type": "application/json" });
+  // Get Ecast room info
+  const roomMatch = path.match(/^\/api\/v2\/rooms\/([A-Z]{4})$/);
+  if (roomMatch) {
+    const room = ecastRooms.get(roomMatch[1]);
+    if (!room) { res.writeHead(404); res.end(JSON.stringify({ error: "Room not found" })); return; }
+    res.writeHead(200);
     res.end(JSON.stringify({
-      ok: true,
-      body: {
-        code: room.code, appTag: room.appTag, joinAs: "player",
-        token: `player_${Date.now()}`,
-        successUrl: `${WS_PROTO}://${ACCESSIBLE_HOST}/api/v2/rooms/${room.code}/play`,
-      },
+      roomId: room.code,
+      appTag: room.appTag,
+      locked: room.locked,
+      players: [...room.clients.values()].map(c => ({ id: c.id, name: c.name })),
     }));
     return;
   }
 
-  // ---- ECAST: POST /api/v2/rooms/:code/join ----
-  const ecastJoinM = path.match(/^\/api\/v2\/rooms\/([A-Za-z]{4})\/join$/i);
-  if (ecastJoinM) {
-    const code = ecastJoinM[1].toUpperCase();
-    const room = ecastRooms[code];
-    if (!room) { res.writeHead(404); res.end(JSON.stringify({ ok: false })); return; }
-    res.writeHead(200, { "Content-Type": "application/json" });
+  // ── Blobcast / API v1 ───────────────────────────────────────────────────────
+
+  // Create Blobcast room
+  if (path === "/room" && req.method === "POST") {
+    let body = "";
+    req.on("data", d => body += d);
+    req.on("end", () => {
+      let data = {};
+      try { data = JSON.parse(body); } catch {}
+
+      const code = uniqueRoomCode(blobcastRooms);
+      blobcastRooms.set(code, {
+        code,
+        appTag:    data.appTag   || "unknown",
+        server:    HOST,
+        host:      null,
+        clients:   new Map(),   // userId -> socket+info
+        locked:    false,
+        audienceEnabled: false,
+        created:   Date.now(),
+        state:     {},
+        seq:       0,
+      });
+
+      res.writeHead(200);
+      res.end(JSON.stringify({
+        roomid: code,
+        server: HOST,
+        apptag: data.appTag || "unknown",
+      }));
+    });
+    return;
+  }
+
+  // Get Blobcast room info
+  const blobRoomMatch = path.match(/^\/room\/([A-Z]{4})\/?/);
+  if (blobRoomMatch) {
+    const room = blobcastRooms.get(blobRoomMatch[1]);
+    if (!room) { res.writeHead(404); res.end(JSON.stringify({ roomid: null })); return; }
+    res.writeHead(200);
     res.end(JSON.stringify({
-      ok: true,
-      body: {
-        joinAs: "player", token: `player_${Date.now()}`,
-        successUrl: `${WS_PROTO}://${ACCESSIBLE_HOST}/api/v2/rooms/${code}/play`,
-      },
+      roomid: room.code,
+      server: HOST,
+      apptag: room.appTag,
+      locked: room.locked,
+      audienceEnabled: room.audienceEnabled,
     }));
     return;
   }
 
-  // ---- BLOBCAST: GET /room/:code/ ----
-  const blobRoomM = path.match(/^\/room\/([A-Za-z]{4})\/?$/i);
-  if (blobRoomM) {
-    const code = blobRoomM[1].toUpperCase();
-    const room = blobRooms[code];
-    if (!room) {
-      res.writeHead(404, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ success: false, message: "room not found" }));
+  // Health check
+  res.writeHead(200);
+  res.end(JSON.stringify({ ok: true, blobcastRooms: blobcastRooms.size, ecastRooms: ecastRooms.size }));
+});
+
+// ─── ECAST WEBSOCKET (API v2) ─────────────────────────────────────────────────
+const ecastWss = new WebSocketServer({ noServer: true });
+
+ecastWss.on("connection", (ws, req, roomCode, isHost) => {
+  const room = ecastRooms.get(roomCode);
+  if (!room) { ws.close(4004, "Room not found"); return; }
+
+  const url  = new URL(req.url, `http://${req.headers.host}`);
+  const userId = url.searchParams.get("userId") || crypto.randomUUID?.() || Math.random().toString(36).slice(2);
+  const name   = url.searchParams.get("name")   || "Player";
+  const role   = isHost ? "host" : url.searchParams.get("role") || "player";
+
+  const client = { ws, id: userId, name, role, seq: 0 };
+
+  if (role === "host") {
+    room.host = client;
+  } else if (role === "audience") {
+    room.audience.set(userId, client);
+  } else {
+    room.clients.set(userId, client);
+  }
+
+  function send(obj) {
+    if (ws.readyState === WebSocket.OPEN)
+      ws.send(JSON.stringify(obj));
+  }
+
+  // Welcome
+  send({ opcode: "client/connected", result: "ok" });
+
+  // Notify host of new player
+  if (role !== "host" && room.host && room.host.ws.readyState === WebSocket.OPEN) {
+    room.host.ws.send(JSON.stringify({
+      opcode: "client/join",
+      userId, name, role,
+    }));
+  }
+
+  ws.on("message", (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+    console.log(`[Ecast][${roomCode}][${role}] ${JSON.stringify(msg)}`);
+
+    const op = msg.opcode || msg.type || "";
+
+    // Broadcast from host to all players
+    if (op === "bc/server/send" || op === "server/send") {
+      const payload = msg.params || msg.body || {};
+      for (const [, c] of room.clients) {
+        if (c.ws.readyState === WebSocket.OPEN)
+          c.ws.send(JSON.stringify({ opcode: "client/recv", ...payload }));
+      }
       return;
     }
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
-      success: true,
-      server: ACCESSIBLE_HOST,
-      apptag: room.appTag,
-      numAudience: 0,
-      joinAs: "player",
-      requiresPassword: false,
-    }));
-    return;
-  }
 
-  // ---- BLOBCAST: POST /room ----
-  if ((path === "/room" || path === "/room/") && req.method === "POST") {
-    let body = "";
-    req.on("data", c => body += c);
-    req.on("end", () => {
-      let appTag = "unknown";
-      try { appTag = JSON.parse(body).apptag || JSON.parse(body).appTag || appTag; } catch(e) {}
-      const room = blobCreateRoom(appTag);
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ success: true, code: room.code, server: ACCESSIBLE_HOST }));
-    });
-    return;
-  }
+    // Player sends to host
+    if (op === "bc/client/send" || op === "client/send") {
+      if (room.host && room.host.ws.readyState === WebSocket.OPEN) {
+        room.host.ws.send(JSON.stringify({
+          opcode: "client/send",
+          userId, name,
+          body: msg.params || msg.body || {},
+        }));
+      }
+      return;
+    }
 
-  // ---- Engine.IO HTTP polling (fallback для старых клиентов) ----
-  if (path === "/socket.io/" || path === "/socket.io") {
-    const sid = parsed.searchParams.get("sid") || genSID();
-    if (!parsed.searchParams.get("sid")) {
-      const packet = "0" + JSON.stringify({ sid, upgrades: ["websocket"], pingInterval: 25000, pingTimeout: 60000 });
-      res.writeHead(200, { "Content-Type": "text/plain; charset=UTF-8", "Access-Control-Allow-Origin": "*" });
-      res.end(packet.length + ":" + packet);
+    // Room state update
+    if (op === "bc/server/setState" || op === "server/setState") {
+      const blob = msg.params?.blob || msg.blob;
+      if (blob !== undefined) room.state = { ...room.state, blob };
+      broadcastEcast(room, { opcode: "client/setState", blob: room.state.blob });
+      return;
+    }
+
+    // Lock room
+    if (op === "bc/server/lock") {
+      room.locked = msg.params?.lock !== false;
+      broadcastEcast(room, { opcode: "client/lock", locked: room.locked });
+      return;
+    }
+
+    // Generic relay: route by opcode prefix
+    if (op.startsWith("bc/server/") || role === "host") {
+      broadcastEcast(room, { opcode: op.replace("bc/server/", "client/"), ...( msg.params || {}) });
     } else {
-      res.writeHead(200, { "Content-Type": "text/plain; charset=UTF-8", "Access-Control-Allow-Origin": "*" });
-      res.end("1:6");
-    }
-    return;
-  }
-
-  // ---- Статус сервера ----
-  if (path === "/" || path === "/health" || path === "/status") {
-    const eRooms = Object.keys(ecastRooms).map(c => ({
-      code: c, proto: "ecast (PP7/PP8)", appTag: ecastRooms[c].appTag,
-      players: Object.keys(ecastRooms[c].players).length,
-    }));
-    const bRooms = Object.keys(blobRooms).map(c => ({
-      code: c, proto: "blobcast (PP1-PP6)", appTag: blobRooms[c].appTag,
-      players: Object.keys(blobRooms[c].players).length,
-    }));
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
-      status: "ok",
-      server: "Jackbox All-in-One Private Server v2.0",
-      host: ACCESSIBLE_HOST,
-      protocols: ["ecast/v2 (PP7, PP8, Drawful2)", "blobcast/v1 (PP1, PP2, PP3, PP4, PP5, PP6)"],
-      activeRooms: eRooms.length + bRooms.length,
-      rooms: [...eRooms, ...bRooms],
-    }));
-    return;
-  }
-
-  res.writeHead(404); res.end(JSON.stringify({ error: "not found" }));
-});
-
-// ==================== WEBSOCKET ROUTING ====================
-var wss = new wslib.WebSocketServer({ server, clientTracking: true });
-
-wss.on("connection", (ws, req) => {
-  const parsed = parseURL(req.url, req.headers.host);
-  const path = parsed.pathname;
-  const query = parsed.searchParams;
-
-  // Ecast WebSocket
-  const ecastM = path.match(/^\/api\/v2\/rooms\/([A-Za-z]{4})\/play$/i);
-  if (ecastM) {
-    const code = ecastM[1].toUpperCase();
-    const isHost = query.get("role") === "host" || query.get("joinAs") === "host";
-    handleEcastWS(ws, code, isHost, query);
-    return;
-  }
-
-  // Blobcast WebSocket (socket.io path)
-  if (path === "/socket.io/" || path === "/socket.io") {
-    handleBlobcastWS(ws, query);
-    return;
-  }
-
-  ws.close(1008, "unknown path");
-});
-
-// ==================== ECAST WS HANDLER ====================
-function handleEcastWS(ws, code, isHost, query) {
-  if (isHost) {
-    if (!ecastRooms[code]) {
-      ecastRooms[code] = {
-        code, appTag: query.get("appTag") || "unknown",
-        hostSocket: null, hostPC: 0,
-        players: {}, playerCount: 0,
-        blobs: {}, acls: {},
-        locked: false, created: Date.now(),
-      };
-    }
-    const room = ecastRooms[code];
-    room.hostSocket = ws;
-    console.log(`[Ecast] Host connected to ${code}`);
-
-    ws.send(JSON.stringify({ opcode: "connected", result: { host: ACCESSIBLE_HOST, code } }));
-
-    ws.on("message", raw => {
-      let m; try { m = JSON.parse(raw); } catch(e) { return; }
-      handleEcastHostMsg(room, ws, m);
-    });
-    ws.on("close", () => {
-      console.log(`[Ecast] Host left ${code}`);
-      if (ecastRooms[code]) ecastRooms[code].hostSocket = null;
-    });
-    ws.on("error", e => console.log(`[Ecast:host:${code}] ${e.message}`));
-    return;
-  }
-
-  // Player connection
-  const room = ecastRooms[code];
-  if (!room) {
-    ws.send(JSON.stringify({ opcode: "error", error: "room not found" }));
-    ws.close(); return;
-  }
-
-  room.playerCount++;
-  const pid = String(room.playerCount + 1);
-  const name = query.get("name") || `Player ${pid}`;
-  room.players[pid] = { socket: ws, id: pid, roles: { player: { name } }, name };
-  console.log(`[Ecast] Player "${name}"(${pid}) joined ${code}`);
-
-  ws.send(JSON.stringify({ opcode: "connected", result: { id: pid, secret: `s_${pid}_${Date.now()}` } }));
-
-  // Send existing blobs
-  for (const key in room.blobs) {
-    const acl = room.acls[key];
-    if (!acl || acl === "*" || acl === `id:${pid}`) {
-      ws.send(JSON.stringify({ opcode: "object", params: { key }, result: { val: room.blobs[key] } }));
-    }
-  }
-
-  // Notify host
-  if (room.hostSocket && room.hostSocket.readyState === wslib.WebSocket.OPEN) {
-    room.hostSocket.send(JSON.stringify({
-      pc: ++room.hostPC, opcode: "client/connected",
-      result: { id: pid, roles: room.players[pid].roles },
-    }));
-  }
-
-  ws.on("message", raw => {
-    let m; try { m = JSON.parse(raw); } catch(e) { return; }
-    if (room.hostSocket && room.hostSocket.readyState === wslib.WebSocket.OPEN) {
-      room.hostSocket.send(JSON.stringify({
-        pc: ++room.hostPC, opcode: m.opcode || "msg",
-        result: m.params || m.result || {}, from: pid,
-      }));
+      if (room.host && room.host.ws.readyState === WebSocket.OPEN)
+        room.host.ws.send(JSON.stringify({ opcode: op, userId, name, ...(msg.params || {}) }));
     }
   });
 
   ws.on("close", () => {
-    console.log(`[Ecast] Player ${pid} left ${code}`);
-    delete room.players[pid];
-    if (room.hostSocket && room.hostSocket.readyState === wslib.WebSocket.OPEN) {
-      room.hostSocket.send(JSON.stringify({
-        pc: ++room.hostPC, opcode: "client/disconnected", result: { id: pid },
-      }));
+    room.clients.delete(userId);
+    room.audience.delete(userId);
+    if (room.host === client) room.host = null;
+    if (room.host && room.host.ws.readyState === WebSocket.OPEN) {
+      room.host.ws.send(JSON.stringify({ opcode: "client/leave", userId, name }));
     }
   });
-  ws.on("error", e => console.log(`[Ecast:player:${code}:${pid}] ${e.message}`));
-}
+});
 
-function handleEcastHostMsg(room, ws, m) {
-  const op = m.opcode;
-  switch (op) {
-    case "room/set": {
-      const { key, val, acl } = m.params || {};
-      if (key === undefined) break;
-      room.blobs[key] = val;
-      if (acl !== undefined) room.acls[key] = acl;
-      for (const pid in room.players) {
-        const p = room.players[pid];
-        if (p.socket.readyState !== wslib.WebSocket.OPEN) continue;
-        const a = room.acls[key];
-        if (!a || a === "*" || a === `id:${pid}`) {
-          p.socket.send(JSON.stringify({ opcode: "object", params: { key }, result: { val } }));
-        }
-      }
-      ecastSendHostOk(room, ws, m.seq);
-      break;
-    }
-    case "room/send": {
-      const { to, body, opcode: msgOp } = m.params || {};
-      const ev = msgOp || "msg";
-      if (to === "*" || !to) {
-        ecastBroadcastPlayers(room, { opcode: ev, result: body, from: "1" });
-      } else {
-        const t = room.players[to];
-        if (t && t.socket.readyState === wslib.WebSocket.OPEN) {
-          t.socket.send(JSON.stringify({ opcode: ev, result: body, from: "1" }));
-        }
-      }
-      ecastSendHostOk(room, ws, m.seq);
-      break;
-    }
-    case "room/lock":   room.locked = true;  ecastSendHostOk(room, ws, m.seq); break;
-    case "room/unlock": room.locked = false; ecastSendHostOk(room, ws, m.seq); break;
-    case "room/kick": {
-      const kid = m.params && m.params.id;
-      const p = room.players[kid];
-      if (p) { p.socket.send(JSON.stringify({ opcode: "client/kicked" })); p.socket.close(); delete room.players[kid]; }
-      ecastSendHostOk(room, ws, m.seq);
-      break;
-    }
-    default: ecastSendHostOk(room, ws, m.seq);
+function broadcastEcast(room, msg) {
+  const str = JSON.stringify(msg);
+  for (const [, c] of room.clients) {
+    if (c.ws.readyState === WebSocket.OPEN) c.ws.send(str);
+  }
+  for (const [, c] of room.audience) {
+    if (c.ws.readyState === WebSocket.OPEN) c.ws.send(str);
   }
 }
 
-// ==================== BLOBCAST WS HANDLER ====================
-function handleBlobcastWS(ws, query) {
-  const sid = query.get("sid") || genSID();
-  ws._bcSID = sid;
+// ─── BLOBCAST WEBSOCKET (API v1) ──────────────────────────────────────────────
+// Blobcast uses a custom framing over WebSocket (NOT socket.io, despite old docs).
+// Modern Jackbox games that use "blobcast" actually connect via plain WebSocket
+// with JSON messages similar to Ecast but with different opcodes.
+// Frame format: sequence|opcode|body_json
+const blobcastWss = new WebSocketServer({ noServer: true });
 
-  ws.send(eioOpen(sid));
-  ws.send("40"); // Socket.IO connect
+blobcastWss.on("connection", (ws, req, roomCode) => {
+  let room = blobcastRooms.get(roomCode);
+  if (!room) {
+    // Auto-create room if game creates it via WS directly
+    room = {
+      code: roomCode,
+      appTag: "unknown",
+      server: HOST,
+      host: null,
+      clients: new Map(),
+      locked: false,
+      audienceEnabled: false,
+      created: Date.now(),
+      state: {},
+      seq: 0,
+    };
+    blobcastRooms.set(roomCode, room);
+  }
 
-  ws._bcPing = setInterval(() => {
-    if (ws.readyState === wslib.WebSocket.OPEN) ws.send("2");
-  }, 25000);
+  const url    = new URL(req.url, `http://${req.headers.host}`);
+  const userId = url.searchParams.get("userId") || Math.random().toString(36).slice(2);
+  const name   = url.searchParams.get("name")   || "Player";
+  const role   = url.searchParams.get("role")   || "player"; // "host" or "player" or "audience"
 
-  ws.on("message", raw => handleBlobcastMsg(ws, sid, raw.toString()));
-  ws.on("close", () => { clearInterval(ws._bcPing); handleBlobcastDisconnect(sid); });
-  ws.on("error", e => console.log(`[Blobcast:${sid}] ${e.message}`));
-}
+  let seq = 0;
 
-function handleBlobcastMsg(ws, sid, raw) {
-  if (raw[0] === "3") return; // pong
-  if (raw[0] !== "4" || raw[1] !== "2") return; // only EVENT
+  function sendBlob(opcode, body) {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    seq++;
+    // Blobcast wire format: "SEQ\topcode\tbody_json"  (tab-separated)
+    ws.send(`${seq}\t${opcode}\t${JSON.stringify(body)}`);
+  }
 
-  let payload = raw.slice(2);
-  let ackId = null;
-  const ackM = payload.match(/^(\d+)(\[.*)/s);
-  if (ackM) { ackId = ackM[1]; payload = ackM[2]; }
+  function sendJson(obj) {
+    if (ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify(obj));
+  }
 
-  let arr; try { arr = JSON.parse(payload); } catch(e) { return; }
-  handleBlobcastEvent(ws, sid, arr[0], arr[1], ackId);
-}
+  const client = { ws, id: userId, name, role, sendBlob, sendJson };
 
-function handleBlobcastEvent(ws, sid, event, data, ackId) {
-  console.log(`[Blobcast:${sid}] ${event}`);
-  const reply = (ev, d) => sendSIO(ws, ev, d);
-  const ack = (d) => { if (ackId) try { ws.send(sioAck(ackId, d)); } catch(e) {} };
+  if (role === "host") {
+    room.host = client;
+    console.log(`[Blobcast][${roomCode}] Host connected`);
+    sendBlob("ok", { roomid: roomCode, server: HOST });
+  } else {
+    room.clients.set(userId, client);
+    console.log(`[Blobcast][${roomCode}] Player ${name} (${userId}) connected`);
+    sendBlob("ok", { userid: userId });
 
-  switch (event) {
-
-    case "room/create":
-    case "create": {
-      const appTag = (data && (data.apptag || data.appTag)) || "unknown";
-      const room = blobCreateRoom(appTag);
-      room.hostSocket = ws;
-      room.hostSID = sid;
-      sidToRoom[sid] = { code: room.code, isHost: true };
-      reply("room/created", { code: room.code, server: ACCESSIBLE_HOST, apptag: appTag });
-      ack({ code: room.code });
-      break;
+    // Notify host
+    if (room.host) {
+      room.host.sendBlob("client:joined", { userId, name, role });
     }
 
-    case "room/join":
-    case "join": {
-      const code = ((data && (data.roomid || data.code || data.roomId)) || "").toUpperCase();
-      const userId = (data && (data.userid || data.userId)) || sid;
-      const name = (data && data.name) || "Player";
-      const room = blobRooms[code];
+    // Send current room state to new player
+    if (room.state && Object.keys(room.state).length > 0) {
+      sendBlob("object", { key: "bc:room", val: room.state });
+    }
+  }
 
-      if (!room) { reply("room/error", { code: 404, message: "Room not found" }); return; }
-      if (room.locked) { reply("room/error", { code: 403, message: "Room locked" }); return; }
+  ws.on("message", (raw) => {
+    const str = raw.toString();
+    console.log(`[Blobcast][${roomCode}][${role}] RAW: ${str.substring(0, 200)}`);
 
-      room.players[sid] = { socket: ws, sid, userId, name };
-      sidToRoom[sid] = { code, isHost: false };
+    // Try tab-separated blobcast frame first
+    const parts = str.split("\t");
+    if (parts.length >= 3) {
+      const msgSeq = parts[0];
+      const opcode = parts[1];
+      let body = {};
+      try { body = JSON.parse(parts.slice(2).join("\t")); } catch {}
+      handleBlobcastMessage(room, client, opcode, body, msgSeq);
+      return;
+    }
 
-      // Send current state to player
-      for (const key in room.blobs) sendSIO(ws, "text", { key, val: room.blobs[key], seq: 0 });
+    // Fallback: plain JSON
+    let msg;
+    try { msg = JSON.parse(str); } catch { return; }
+    const opcode = msg.type || msg.opcode || msg.key || "";
+    handleBlobcastMessage(room, client, opcode, msg, "");
+  });
 
-      reply("room/joined", { code, apptag: room.appTag, joinType: "player" });
-      ack({ success: true });
+  ws.on("close", () => {
+    room.clients.delete(userId);
+    if (room.host === client) {
+      room.host = null;
+      broadcastBlob(room, "server:disconnect", { reason: "Host disconnected" });
+    } else {
+      if (room.host) room.host.sendBlob("client:left", { userId, name });
+      broadcastBlob(room, "client:left", { userId, name });
+    }
+    console.log(`[Blobcast][${roomCode}] ${role} ${name} disconnected`);
+  });
+});
 
-      if (room.hostSocket && room.hostSocket.readyState === wslib.WebSocket.OPEN) {
-        sendSIO(room.hostSocket, "client/connected", { id: sid, userId, name, roles: { player: { name } } });
+function handleBlobcastMessage(room, client, opcode, body, msgSeq) {
+  const { role, id: userId, name } = client;
+
+  switch (opcode) {
+    // ── Host → Server ────────────────────────────────────────────────────────
+
+    case "bc:room":
+    case "object":
+      if (role === "host" && body.key === "bc:room") {
+        room.state = body.val || body;
+        broadcastBlob(room, "object", { key: "bc:room", val: room.state });
+      } else if (role === "host") {
+        broadcastBlob(room, "object", body);
       }
       break;
-    }
 
-    case "text":
-    case "room/set":
-    case "set": {
-      const info = sidToRoom[sid];
-      if (!info) return;
-      const room = blobRooms[info.code];
-      if (!room) return;
-
-      const { key, val, acl } = data || {};
-      const seq = (data && data.seq) || ++room.seq;
-      if (key === undefined) return;
-      room.blobs[key] = val;
-
-      if (info.isHost) {
-        for (const pid in room.players) {
-          const p = room.players[pid];
-          if (!p.socket || p.socket.readyState !== wslib.WebSocket.OPEN) continue;
-          if (acl && acl !== "*" && acl !== `id:${pid}`) continue;
-          sendSIO(p.socket, "text", { key, val, seq });
-        }
-      } else {
-        if (room.hostSocket && room.hostSocket.readyState === wslib.WebSocket.OPEN) {
-          sendSIO(room.hostSocket, "text", {
-            key, val, seq, from: sid,
-            userId: room.players[sid] && room.players[sid].userId,
-          });
-        }
-      }
-      reply("result", { seq, success: true });
-      ack({ seq });
+    case "setState":
+    case "bc:setState":
+      room.state = { ...room.state, ...(body.state || body) };
+      broadcastBlob(room, "object", { key: "bc:room", val: room.state });
       break;
-    }
+
+    case "send":
+    case "bc:send":
+      // Host broadcasting to all players
+      broadcastBlob(room, "msg", { from: "server", body });
+      break;
+
+    case "lock":
+      room.locked = body.lock !== false;
+      broadcastBlob(room, "lock", { locked: room.locked });
+      break;
+
+    case "kick":
+      const target = room.clients.get(body.userId);
+      if (target) {
+        target.sendBlob("kicked", { reason: body.reason || "Kicked by host" });
+        target.ws.close();
+        room.clients.delete(body.userId);
+      }
+      break;
+
+    // ── Player → Server ──────────────────────────────────────────────────────
 
     case "msg":
-    case "room/send":
-    case "send": {
-      const info = sidToRoom[sid];
-      if (!info) return;
-      const room = blobRooms[info.code];
-      if (!room) return;
+    case "bc:msg":
+      // Player message → forward to host
+      if (room.host) {
+        room.host.sendBlob("msg", { userId, name, body });
+      }
+      break;
 
-      const to = data && data.to;
-      const body = data && (data.body || data.val);
-      const msgOp = (data && data.opcode) || event;
-      const seq = ++room.seq;
+    case "bc:client":
+    case "client":
+      // Player state update → forward to host
+      if (room.host) {
+        room.host.sendBlob("object", { key: `bc:client:${userId}`, val: body.val || body });
+      }
+      break;
 
-      if (info.isHost) {
-        if (!to || to === "*") {
-          for (const pid in room.players) {
-            const p = room.players[pid];
-            if (p.socket && p.socket.readyState === wslib.WebSocket.OPEN) sendSIO(p.socket, msgOp, { body, seq, from: "host" });
-          }
-        } else {
-          const t = room.players[to];
-          if (t && t.socket && t.socket.readyState === wslib.WebSocket.OPEN) sendSIO(t.socket, msgOp, { body, seq, from: "host" });
-        }
+    // ── Generic relay ────────────────────────────────────────────────────────
+    default:
+      if (role === "host") {
+        // Host → broadcast to all players
+        broadcastBlob(room, opcode, body);
       } else {
-        if (room.hostSocket && room.hostSocket.readyState === wslib.WebSocket.OPEN) {
-          sendSIO(room.hostSocket, msgOp, {
-            body, seq, from: sid,
-            userId: room.players[sid] && room.players[sid].userId,
-          });
-        }
+        // Player → forward to host
+        if (room.host) room.host.sendBlob(opcode, { userId, name, ...body });
       }
-      reply("result", { seq, success: true });
-      ack({ seq });
       break;
-    }
-
-    case "room/lock":
-    case "lock": {
-      const info = sidToRoom[sid];
-      if (info && blobRooms[info.code]) blobRooms[info.code].locked = true;
-      reply("result", { success: true }); ack({ success: true });
-      break;
-    }
-    case "room/unlock":
-    case "unlock": {
-      const info = sidToRoom[sid];
-      if (info && blobRooms[info.code]) blobRooms[info.code].locked = false;
-      reply("result", { success: true }); ack({ success: true });
-      break;
-    }
-    case "kick": {
-      const info = sidToRoom[sid];
-      if (!info || !info.isHost) return;
-      const room = blobRooms[info.code];
-      if (!room) return;
-      const p = room.players[data && data.id];
-      if (p && p.socket) {
-        sendSIO(p.socket, "kicked", {});
-        p.socket.close();
-        delete room.players[data.id];
-      }
-      reply("result", { success: true }); ack({ success: true });
-      break;
-    }
-
-    default: ack({ success: true });
   }
 }
 
-function handleBlobcastDisconnect(sid) {
-  const info = sidToRoom[sid];
-  if (!info) return;
-  const room = blobRooms[info.code];
-  delete sidToRoom[sid];
-  if (!room) return;
-
-  if (info.isHost) {
-    console.log(`[Blobcast] Host disconnected from ${info.code}`);
-    room.hostSocket = null;
-    for (const pid in room.players) {
-      const p = room.players[pid];
-      if (p.socket && p.socket.readyState === wslib.WebSocket.OPEN)
-        sendSIO(p.socket, "room/closed", { reason: "host disconnected" });
-    }
-    setTimeout(() => { delete blobRooms[info.code]; }, 5000);
-  } else {
-    const player = room.players[sid];
-    if (player && room.hostSocket && room.hostSocket.readyState === wslib.WebSocket.OPEN) {
-      sendSIO(room.hostSocket, "client/disconnected", { id: sid, userId: player.userId, name: player.name });
-    }
-    delete room.players[sid];
+function broadcastBlob(room, opcode, body) {
+  for (const [, c] of room.clients) {
+    try { c.sendBlob(opcode, body); } catch {}
   }
 }
 
-// ==================== CLEANUP ====================
+// ─── WEBSOCKET UPGRADE ROUTING ────────────────────────────────────────────────
+httpServer.on("upgrade", (req, socket, head) => {
+  const url  = new URL(req.url, `http://${req.headers.host}`);
+  const path = url.pathname;
+
+  console.log(`WS Upgrade: ${path}`);
+
+  // Ecast: /api/v2/rooms/:code/play  or  /api/v2/rooms/:code
+  const ecastMatch = path.match(/^\/api\/v2\/rooms\/([A-Z]{4})(\/play)?/);
+  if (ecastMatch) {
+    const roomCode = ecastMatch[1];
+    const isHost   = url.searchParams.get("role") === "host";
+    ecastWss.handleUpgrade(req, socket, head, (ws) => {
+      ecastWss.emit("connection", ws, req, roomCode, isHost);
+    });
+    return;
+  }
+
+  // Blobcast: /api/v2/rooms/:code  (some games use this path for blobcast too)
+  // Blobcast: /socket/:code  or  /room/:code  or  /blobcast/:code
+  const blobMatch = path.match(/^\/(socket|room|blobcast|play)\/([A-Z]{4})/);
+  if (blobMatch) {
+    const roomCode = blobMatch[2];
+    blobcastWss.handleUpgrade(req, socket, head, (ws) => {
+      blobcastWss.emit("connection", ws, req, roomCode);
+    });
+    return;
+  }
+
+  // Blobcast: /api/v2/rooms/:code/player  (PP6 style)
+  const blobPlayerMatch = path.match(/^\/api\/v2\/rooms\/([A-Z]{4})\/(player|audience|host)/);
+  if (blobPlayerMatch) {
+    const roomCode = blobPlayerMatch[1];
+    blobcastWss.handleUpgrade(req, socket, head, (ws) => {
+      blobcastWss.emit("connection", ws, req, roomCode);
+    });
+    return;
+  }
+
+  socket.destroy();
+});
+
+// ─── CLEANUP OLD ROOMS ────────────────────────────────────────────────────────
 setInterval(() => {
   const now = Date.now();
-  const limit = 4 * 60 * 60 * 1000;
-  for (const c in ecastRooms) if (now - ecastRooms[c].created > limit) delete ecastRooms[c];
-  for (const c in blobRooms) if (now - blobRooms[c].created > limit) delete blobRooms[c];
-}, 30 * 60 * 1000);
+  for (const [code, room] of blobcastRooms) {
+    if (now - room.created > 3600_000) blobcastRooms.delete(code);
+  }
+  for (const [code, room] of ecastRooms) {
+    if (now - room.created > 3600_000) ecastRooms.delete(code);
+  }
+}, 300_000);
 
-// ==================== START ====================
-server.listen(PORT, () => {
-  console.log(`\n✅ Server ready on port ${PORT}`);
-  console.log(`\n📋 Конфиг для игры (jbg.config.jet):`);
-  console.log(`   "serverUrl": "https://${ACCESSIBLE_HOST}"`);
-  console.log(`\n   Steam Launch Options:`);
-  console.log(`   -jbg.config serverUrl=https://${ACCESSIBLE_HOST}\n`);
+// ─── START ────────────────────────────────────────────────────────────────────
+httpServer.listen(PORT, () => {
+  console.log(`
+╔══════════════════════════════════════════════╗
+║       Jackbox Private Server Running         ║
+╠══════════════════════════════════════════════╣
+║  Ecast  (PP7, PP8, Drawful 2 Int):           ║
+║    serverUrl = https://${HOST.padEnd(20)} ║
+║                                              ║
+║  Blobcast (PP1-PP6, Fibbage, Quiplash):      ║
+║    blobcastHost = https://${HOST.padEnd(16)} ║
+╚══════════════════════════════════════════════╝
+  `);
 });
