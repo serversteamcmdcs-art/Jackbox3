@@ -64,7 +64,10 @@ const server = http.createServer((req, res) => {
 
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
 
+  // Log ALL headers and query params for debugging
   console.log(`HTTP ${req.method} ${req.url}`);
+  console.log(`  Headers: ${JSON.stringify(req.headers)}`);
+  if (u.search) console.log(`  Query: ${u.search}`);
 
   const readBody = () => new Promise(ok => {
     let b = ""; req.on("data", d => b += d); req.on("end", () => ok(b));
@@ -91,20 +94,27 @@ const server = http.createServer((req, res) => {
 
       console.log(`[Blobcast] Room CREATED: ${code} appTag=${appTag} userId=${userId}`);
 
-      res.writeHead(200);
-      res.end(JSON.stringify({
-        roomid: code,
+      const roomResp = {
+        roomid: code, roomId: code,
         server: HOST,
-        apptag: appTag,
-        appid:  room.appId,
-        numPlayers: 0,
-        numAudience: 0,
+        apptag: appTag, appTag: appTag,
+        appid:  room.appId, appId: room.appId,
+        numPlayers: 0, numAudience: 0,
         audienceEnabled: true,
         requiresPassword: false,
         locked: false,
-        error: "",
-        success: true,
-      }));
+        joinAs: "player",
+        // WebSocket info (various PP versions use different fields)
+        wsUrl:        `wss://${HOST}`,
+        blobcastHost: HOST,
+        blobcastPort: 443,
+        host: HOST,
+        port: 443,
+        error: "", success: true,
+      };
+      console.log(`  /room response: ${JSON.stringify(roomResp)}`);
+      res.writeHead(200);
+      res.end(JSON.stringify(roomResp));
     };
 
     if (req.method === "POST") {
@@ -398,33 +408,47 @@ server.on("upgrade", (req, socket, head) => {
   const u    = new URL(req.url, `http://${req.headers.host}`);
   const path = u.pathname;
 
-  console.log(`WS Upgrade: ${path}`);
+  console.log(`WS Upgrade: ${path}${u.search}`);
+  console.log(`  WS Headers: host=${req.headers.host} origin=${req.headers.origin}`);
 
-  // Ecast paths
+  // Ecast: /api/v2/rooms/CODE  or  /api/v2/rooms/CODE/play
   const ecastM = path.match(/\/api\/v2\/rooms\/([A-Za-z]{4})(\/play)?$/i);
   if (ecastM) {
     const code = ecastM[1].toUpperCase();
+    console.log(`  → Ecast room ${code}`);
     ecastWss.handleUpgrade(req, socket, head, ws => ecastWss.emit("connection", ws, req, code));
     return;
   }
 
-  // Blobcast: /socket/CODE  /room/CODE  /play/CODE  /blobcast/CODE
-  const blobPathM = path.match(/^\/(socket|room|play|blobcast|bc)\/([A-Za-z]{4})/i);
+  // Blobcast path patterns: /socket/CODE  /room/CODE  /play/CODE  /csp/CODE  /blobcast/CODE
+  const blobPathM = path.match(/^\/(socket|room|play|blobcast|bc|csp|live)\/([A-Za-z]{4})/i);
   if (blobPathM) {
     const code = blobPathM[2].toUpperCase();
+    console.log(`  → Blobcast room ${code} (path match)`);
     blobWss.handleUpgrade(req, socket, head, ws => blobWss.emit("connection", ws, req, code));
     return;
   }
 
-  // Blobcast: any path with roomId query param
-  const rid = u.searchParams.get("roomId") || u.searchParams.get("roomid");
+  // Blobcast: roomId or roomid in query string
+  const rid = u.searchParams.get("roomId") || u.searchParams.get("roomid")
+           || u.searchParams.get("room_id") || u.searchParams.get("code");
   if (rid?.match(/^[A-Za-z]{4}$/)) {
     const code = rid.toUpperCase();
+    console.log(`  → Blobcast room ${code} (query param)`);
     blobWss.handleUpgrade(req, socket, head, ws => blobWss.emit("connection", ws, req, code));
     return;
   }
 
-  console.warn(`WS: unknown path ${path}, destroying`);
+  // Blobcast: CODE appears directly in path (e.g. /ABCD or /live/ABCD)
+  const codeInPath = path.match(/\/([A-Z]{4})(\/|$)/);
+  if (codeInPath) {
+    const code = codeInPath[1];
+    console.log(`  → Blobcast room ${code} (code in path)`);
+    blobWss.handleUpgrade(req, socket, head, ws => blobWss.emit("connection", ws, req, code));
+    return;
+  }
+
+  console.warn(`WS: no route for path=${path} query=${u.search} — destroying`);
   socket.destroy();
 });
 
