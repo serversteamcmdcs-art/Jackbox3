@@ -16,7 +16,7 @@ const app     = express();
 
 // ── Конфиг ────────────────────────────────────────────────────────────────────
 // Твой домен (после деплоя замени на реальный)
-const YOUR_DOMAIN   = process.env.YOUR_DOMAIN || 'your-domain.onrender.com';
+const YOUR_DOMAIN   = process.env.YOUR_DOMAIN || 'jackbox3.onrender.com';
 
 // Официальные серверы (больше НЕ зависим от jackbox.fun)
 const BUNDLES_HOST  = 'cdn.jackboxgames.com';
@@ -115,13 +115,30 @@ app.use('/api', (req, res) => {
     proxyRequest(API_HOST, '/api' + req.url, req, res);
 });
 
-// Статика (css, js, иконки)
-app.use(express.static(path.join(__dirname, '/')));
+// Статика (css, js, иконки) — ищем папку с index.htm автоматически
+const _fs = require('fs');
+function findStaticDir() {
+    const candidates = [
+        path.join(__dirname),
+        path.join(__dirname, 'client'),
+        path.join(process.cwd()),
+        path.join(process.cwd(), 'client'),
+    ];
+    return candidates.find(p => _fs.existsSync(path.join(p, 'index.htm'))) || __dirname;
+}
+const STATIC_DIR = findStaticDir();
+console.log('[static] serving from:', STATIC_DIR);
+app.use(express.static(STATIC_DIR));
 
 // Главная страница — инжектируем конфиг внутрь HTML
 app.get('/', (req, res) => {
     const fs = require('fs');
-    let html = fs.readFileSync(path.join(__dirname, 'index.htm'), 'utf-8');
+    const indexPath = path.join(STATIC_DIR, 'index.htm');
+    if (!fs.existsSync(indexPath)) {
+        console.error('[ERROR] index.htm не найден в:', STATIC_DIR);
+        return res.status(500).send('index.htm not found');
+    }
+    let html = fs.readFileSync(indexPath, 'utf-8');
 
     // Вставляем конфиг перед </head> — script-0.js прочитает эти переменные
     const inject = `
