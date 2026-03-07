@@ -5640,14 +5640,14 @@ function iE() {
 iE();
 const zt = class zt {
     static get serverUrl() {
-        const t = this.getQueryParam("server") ?? this.getQueryParam("s");
-        return !t || t === "live" ? "ecast.jackboxgames.com" : t === "local" ? "https://localhost" : t.includes("localhost") ? t : `${t}.jackboxgames.com`
+        const t = this.getQueryParam("server") ?? this.getQueryParam("s") ?? window.__JACKBOX_SERVER__;
+        return !t || t === "live" ? "ecast.jackboxgames.com" : t === "local" ? "https://localhost" : t.includes("localhost") ? t : t.includes(".") ? t : `${t}.jackboxgames.com`
     }
     static isDevelopment() {
         return window.location.hostname === "dev.jackbox.tv" || window.location.hostname === "localhost"
     }
     static isProduction() {
-        return window.location.hostname === "jackbox.tv" || window.location.hostname === "jackbox-k17q.onrender.com" || window.location.hostname === "jackbox-1.onrender.com"
+        return window.location.hostname === "jackbox.tv" || window.location.hostname === "jackbox-k17q.onrender.com" || window.location.hostname === "jackbox-1.onrender.com" || (window.__JACKBOX_DOMAIN__ && window.location.hostname === window.__JACKBOX_DOMAIN__) || (!["dev.jackbox.tv","localhost"].includes(window.location.hostname) && window.location.hostname !== "")
     }
     static get isCanvasSupported() {
         const t = document.createElement("canvas");
