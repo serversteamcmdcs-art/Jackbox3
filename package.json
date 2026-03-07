@@ -1,12 +1,18 @@
 {
-  "name": "jackbox-proxy",
-  "version": "1.0.0",
+  "name": "jackbox-universal-proxy",
+  "version": "2.0.0",
+  "description": "Universal reverse proxy for all Jackbox Party Pack versions (Blobcast + Ecast v2)",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev":   "node --watch server.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   },
   "dependencies": {
-    "http-proxy": "^1.18.1",
-    "ws": "^8.13.0"
-  }
+    "http-proxy": "^1.18.1"
+  },
+  "keywords": ["jackbox", "proxy", "ecast", "blobcast"],
+  "license": "MIT"
 }
