@@ -1,18 +1,13 @@
 {
-  "name": "jackbox-universal-proxy",
+  "name": "jackbox-mirror",
   "version": "2.0.0",
-  "description": "Universal reverse proxy for all Jackbox Party Pack versions (Blobcast + Ecast v2)",
+  "description": "Аналог jackbox.fun — независимое зеркало для всех версий Jackbox",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js",
-    "dev":   "node --watch server.js"
+    "start": "node server.js"
   },
-  "engines": {
-    "node": ">=18.0.0"
-  },
+  "engines": { "node": ">=18" },
   "dependencies": {
-    "http-proxy": "^1.18.1"
-  },
-  "keywords": ["jackbox", "proxy", "ecast", "blobcast"],
-  "license": "MIT"
+    "express": "^4.18.2"
+  }
 }
