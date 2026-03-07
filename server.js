@@ -1,17 +1,20 @@
 /**
- * Jackbox Mirror Server v3
+ * Jackbox Mirror Server v4
  *
- * Ключевое отличие от v2:
- *  - /room/ и /socket.io/ используют http-proxy с поддержкой WebSocket (WS Upgrade)
- *  - Обычные HTTP запросы к ecast/api через https.request со спуфингом Origin
- *  - Все запросы притворяются что идут с jackbox.tv
+ * КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ:
+ * Ecast возвращает JSON с "host": "blobcast.jackboxgames.com"
+ * Браузер подключается к этому хосту НАПРЯМУЮ, минуя наш прокси.
+ * Blobcast блокирует запросы не с jackbox.tv → бесконечная загрузка.
+ *
+ * Решение: перехватываем JSON ответы ecast и заменяем host на наш домен.
+ * Тогда браузер подключается к НАМ, а мы проксируем на blobcast со спуфингом.
  */
 
-const path     = require('path');
-const fs       = require('fs');
-const http     = require('http');
-const https    = require('https');
-const express  = require('express');
+const path      = require('path');
+const fs        = require('fs');
+const http      = require('http');
+const https     = require('https');
+const express   = require('express');
 const httpProxy = require('http-proxy');
 
 const app = express();
@@ -23,6 +26,15 @@ const ECAST_HOST    = 'ecast.jackboxgames.com';
 const BLOBCAST_HOST = 'blobcast.jackboxgames.com';
 const API_HOST      = 'api.jackboxgames.com';
 
+// Хосты которые нужно заменять в JSON ответах на наш домен
+const REPLACE_HOSTS = [
+    ECAST_HOST,
+    BLOBCAST_HOST,
+    API_HOST,
+    'jackbox.tv',
+    'dev.jackbox.tv',
+];
+
 // ── Статика ───────────────────────────────────────────────────────────────────
 function findStaticDir() {
     const candidates = [__dirname, path.join(__dirname,'client'), process.cwd(), path.join(process.cwd(),'client')];
@@ -32,7 +44,7 @@ function findStaticDir() {
 }
 const STATIC_DIR = findStaticDir();
 
-// ── WebSocket прокси (для Blobcast Socket.IO — Pack 1–6) ──────────────────────
+// ── WebSocket прокси (Blobcast Socket.IO — Pack 1–6) ─────────────────────────
 const wsProxy = httpProxy.createProxyServer({
     target: 'https://' + BLOBCAST_HOST,
     changeOrigin: true,
@@ -44,20 +56,33 @@ const wsProxy = httpProxy.createProxyServer({
         'referer': 'https://jackbox.tv/',
     },
 });
-
 wsProxy.on('error', (err, req, res) => {
     console.error('[ws-proxy] ERROR:', err.message);
     try { if (res && !res.headersSent) res.writeHead(502); res.end(); } catch(_) {}
 });
-
 wsProxy.on('proxyRes', (proxyRes) => {
     proxyRes.headers['access-control-allow-origin'] = '*';
     delete proxyRes.headers['content-security-policy'];
 });
 
-// ── HTTP прокси-хелпер (для ecast, api, bundles) ──────────────────────────────
-function proxyTo(host, fullPath, req, res, spoofOrigin) {
-    console.log('[http-proxy] ->', host + fullPath);
+// WebSocket прокси для Ecast (Pack 7+)
+const wsEcastProxy = httpProxy.createProxyServer({
+    target: 'https://' + ECAST_HOST,
+    changeOrigin: true,
+    secure: true,
+    ws: true,
+    headers: {
+        'host':    ECAST_HOST,
+        'origin':  'https://jackbox.tv',
+        'referer': 'https://jackbox.tv/',
+    },
+});
+wsEcastProxy.on('error', (err) => console.error('[ws-ecast] ERROR:', err.message));
+
+// ── HTTP прокси с перехватом JSON ─────────────────────────────────────────────
+// replaceHosts: заменить все упоминания официальных хостов на наш домен
+function proxyTo(host, fullPath, req, res, spoofOrigin, replaceHosts) {
+    console.log('[proxy] ->', host + fullPath);
 
     const headers = {
         'User-Agent':      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
@@ -78,25 +103,61 @@ function proxyTo(host, fullPath, req, res, spoofOrigin) {
     const options = { hostname: host, port: 443, path: fullPath, method: req.method || 'GET', headers };
 
     const proxyReq = https.request(options, (proxyRes) => {
-        console.log('[http-proxy] <-', proxyRes.statusCode, fullPath);
+        console.log('[proxy] <-', proxyRes.statusCode, fullPath);
+
         const outHeaders = {
-            'access-control-allow-origin':     '*',
-            'access-control-allow-headers':    '*',
-            'access-control-allow-methods':    'GET,POST,PUT,DELETE,OPTIONS',
-            'access-control-allow-credentials':'true',
+            'access-control-allow-origin':      '*',
+            'access-control-allow-headers':      '*',
+            'access-control-allow-methods':      'GET,POST,PUT,DELETE,OPTIONS',
+            'access-control-allow-credentials':  'true',
         };
-        ['content-type','content-length','cache-control','last-modified','etag','transfer-encoding','set-cookie']
+        const ct = proxyRes.headers['content-type'] || '';
+        ['content-type','cache-control','last-modified','etag','set-cookie']
             .forEach(h => { if (proxyRes.headers[h]) outHeaders[h] = proxyRes.headers[h]; });
         delete outHeaders['x-frame-options'];
         delete outHeaders['content-security-policy'];
-        res.writeHead(proxyRes.statusCode, outHeaders);
-        proxyRes.pipe(res, { end: true });
+
+        // Если это JSON и нужна замена хостов — буферизуем и патчим
+        if (replaceHosts && (ct.includes('json') || ct.includes('javascript'))) {
+            const chunks = [];
+            proxyRes.on('data', chunk => chunks.push(chunk));
+            proxyRes.on('end', () => {
+                let body = Buffer.concat(chunks).toString('utf-8');
+                let patched = false;
+
+                // Заменяем все официальные хосты на наш домен в JSON
+                REPLACE_HOSTS.forEach(h => {
+                    if (body.includes(h)) {
+                        body = body.split(h).join(YOUR_DOMAIN);
+                        patched = true;
+                    }
+                });
+
+                if (patched) {
+                    console.log('[patch] заменены хосты в ответе', fullPath);
+                }
+
+                // Убираем https:// перед нашим доменом если там было jackbox.tv
+                // (наш домен уже содержит https в window.__JACKBOX_SERVER__)
+                const bodyBuf = Buffer.from(body, 'utf-8');
+                outHeaders['content-length'] = bodyBuf.length;
+                res.writeHead(proxyRes.statusCode, outHeaders);
+                res.end(bodyBuf);
+            });
+        } else {
+            // Обычная потоковая передача
+            if (proxyRes.headers['content-length']) outHeaders['content-length'] = proxyRes.headers['content-length'];
+            if (proxyRes.headers['transfer-encoding']) outHeaders['transfer-encoding'] = proxyRes.headers['transfer-encoding'];
+            res.writeHead(proxyRes.statusCode, outHeaders);
+            proxyRes.pipe(res, { end: true });
+        }
     });
 
     proxyReq.on('error', (err) => {
-        console.error('[http-proxy] ERROR', err.message);
+        console.error('[proxy] ERROR', err.message);
         if (!res.headersSent) res.status(502).send('Proxy error: ' + err.message);
     });
+
     if (!['GET','HEAD'].includes(req.method)) req.pipe(proxyReq, { end: true });
     else proxyReq.end();
 }
@@ -111,26 +172,27 @@ app.options('*', (_, res) => res.set({
 
 app.get('/health', (_, res) => res.json({ status: 'ok', domain: YOUR_DOMAIN, time: new Date().toISOString() }));
 
-// Бандлы (script.js каждой игры) — jackbox.fun
-app.use('/main', (req, res) => proxyTo(BUNDLES_HOST, '/main' + req.url, req, res, false));
+// Бандлы игр — jackbox.fun, без замены хостов
+app.use('/main', (req, res) => proxyTo(BUNDLES_HOST, '/main' + req.url, req, res, false, false));
 
-// Ecast HTTP API (Pack 7+) — с Origin: jackbox.tv
-app.use('/ecast', (req, res) => proxyTo(ECAST_HOST, '/ecast' + req.url, req, res, true));
-app.use('/api/v2', (req, res) => proxyTo(ECAST_HOST, '/api/v2' + req.url, req, res, true));
+// Ecast API — с заменой хостов в JSON ответах!
+// Именно здесь ecast возвращает "host": "blobcast.jackboxgames.com"
+// Мы меняем его на наш домен → браузер подключается к нам, а не напрямую
+app.use('/ecast', (req, res) => proxyTo(ECAST_HOST, '/ecast' + req.url, req, res, true, true));
+app.use('/api/v2', (req, res) => proxyTo(ECAST_HOST, '/api/v2' + req.url, req, res, true, true));
 
-// Blobcast HTTP + Socket.IO (Pack 1–6)
-// /room/ и /socket.io/ идут через wsProxy (умеет WebSocket Upgrade)
+// Blobcast HTTP + Socket.IO (Pack 1–6) — через wsProxy
 app.use('/room',      (req, res) => wsProxy.web(req, res, { target: 'https://' + BLOBCAST_HOST }));
 app.use('/socket.io', (req, res) => wsProxy.web(req, res, { target: 'https://' + BLOBCAST_HOST }));
 app.use('/bc',        (req, res) => wsProxy.web(req, res, { target: 'https://' + BLOBCAST_HOST }));
 
 // API
-app.use('/api', (req, res) => proxyTo(API_HOST, '/api' + req.url, req, res, true));
+app.use('/api', (req, res) => proxyTo(API_HOST, '/api' + req.url, req, res, true, true));
 
 // Статика
 app.use(express.static(STATIC_DIR));
 
-// Главная — инжектируем конфиг
+// Главная
 app.get('/', (req, res) => {
     const indexPath = path.join(STATIC_DIR, 'index.htm');
     if (!fs.existsSync(indexPath)) return res.status(500).send('index.htm not found in ' + STATIC_DIR);
@@ -141,37 +203,30 @@ app.get('/', (req, res) => {
     res.send(html);
 });
 
-// ── Создаём HTTP сервер вручную (нужно для WS Upgrade) ────────────────────────
-const PORT = process.env.PORT || 3333;
+// ── HTTP сервер с WebSocket Upgrade ──────────────────────────────────────────
+const PORT   = process.env.PORT || 3333;
 const server = http.createServer(app);
 
-// WebSocket Upgrade — перенаправляем на wsProxy
 server.on('upgrade', (req, socket, head) => {
     const url = req.url || '';
     if (url.startsWith('/room') || url.startsWith('/socket.io') || url.startsWith('/bc')) {
-        console.log('[ws-upgrade] ->', BLOBCAST_HOST + url);
+        console.log('[ws-upgrade] blobcast ->', url);
         wsProxy.ws(req, socket, head, { target: 'https://' + BLOBCAST_HOST });
     } else {
-        // Ecast WebSocket (Pack 7+) — пробрасываем напрямую
-        console.log('[ws-upgrade] ecast ->', ECAST_HOST + url);
-        const wsEcast = httpProxy.createProxyServer({
-            target: 'https://' + ECAST_HOST,
-            changeOrigin: true, secure: true, ws: true,
-            headers: { host: ECAST_HOST, origin: 'https://jackbox.tv' },
-        });
-        wsEcast.ws(req, socket, head, { target: 'https://' + ECAST_HOST });
+        console.log('[ws-upgrade] ecast ->', url);
+        wsEcastProxy.ws(req, socket, head, { target: 'https://' + ECAST_HOST });
     }
 });
 
 server.listen(PORT, () => {
     console.log('\n╔══════════════════════════════════════════════════╗');
-    console.log(  '║        Jackbox Mirror v3 — готов к работе        ║');
+    console.log(  '║        Jackbox Mirror v4 — с патчем хостов       ║');
     console.log(  '╚══════════════════════════════════════════════════╝');
     console.log('  Порт     :', PORT);
     console.log('  Домен    : https://' + YOUR_DOMAIN);
-    console.log('  Статика  :', STATIC_DIR);
-    console.log('  Бандлы   :', BUNDLES_HOST, '(HTTP)');
-    console.log('  Ecast    :', ECAST_HOST, '(HTTP + WS, Pack 7+)');
-    console.log('  Blobcast :', BLOBCAST_HOST, '(HTTP + WS Socket.IO, Pack 1–6)');
+    console.log('  Патч     : заменяем хосты в JSON ответах ecast');
+    console.log('  Бандлы   :', BUNDLES_HOST);
+    console.log('  Ecast    :', ECAST_HOST, '(+JSON патч)');
+    console.log('  Blobcast :', BLOBCAST_HOST, '(HTTP + WS)');
     console.log('  Origin   : spoofed as jackbox.tv\n');
 });
