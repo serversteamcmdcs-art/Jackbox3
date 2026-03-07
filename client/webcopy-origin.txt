@@ -1,0 +1,32 @@
+Uri: https://jackbox.fun/
+File Name: D:\jb-ecast.klucva.ru\5\jackbox.fun\index.htm
+Content Type: text/html
+
+Uri: https://jackbox.fun/apple-touch-icon.png
+File Name: D:\jb-ecast.klucva.ru\5\jackbox.fun\apple-touch-icon.png
+Content Type: image/png
+
+Uri: https://jackbox.fun/favicon-32.png
+File Name: D:\jb-ecast.klucva.ru\5\jackbox.fun\favicon-32.png
+Content Type: image/png
+
+Uri: https://jackbox.fun/favicon.ico
+File Name: D:\jb-ecast.klucva.ru\5\jackbox.fun\favicon.ico
+Content Type: image/x-icon
+
+Uri: https://jackbox.fun/manifest.webmanifest
+File Name: D:\jb-ecast.klucva.ru\5\jackbox.fun\manifest.webmanifest
+Content Type: application/octet-stream
+
+Uri: https://jackbox.fun/script-0.js?v=22022025
+File Name: D:\jb-ecast.klucva.ru\5\jackbox.fun\script-0.js
+Content Type: application/javascript
+
+Uri: https://jackbox.fun/style-0.css
+File Name: D:\jb-ecast.klucva.ru\5\jackbox.fun\style-0.css
+Content Type: text/css
+
+Uri: https://www.googletagmanager.com/gtag/js?id=G-V1QJVQMYF1
+File Name: D:\jb-ecast.klucva.ru\5\jackbox.fun\gtag\js
+Content Type: application/javascript
+
