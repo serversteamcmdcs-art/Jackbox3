@@ -1,13 +1,14 @@
 {
   "name": "jackbox-mirror",
-  "version": "2.0.0",
-  "description": "Аналог jackbox.fun — независимое зеркало для всех версий Jackbox",
+  "version": "3.0.0",
+  "description": "Аналог jackbox.fun — зеркало для всех версий Jackbox",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "engines": { "node": ">=18" },
   "dependencies": {
-    "express": "^4.18.2"
+    "express": "^4.18.2",
+    "http-proxy": "^1.18.1"
   }
 }
